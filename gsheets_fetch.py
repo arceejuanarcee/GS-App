@@ -5,14 +5,8 @@ from google.oauth2.service_account import Credentials
 
 # ===================== CONFIGURATION =====================
 
-# Path to your service account JSON key file
-SERVICE_ACCOUNT_FILE = "C:\\Users\\user-307E6E3400\\Desktop\\Python Scripts\\GS App\\keys\\endless-theorem-421101-fe0721f63c55.json"   # <-- change this
-
-# ID of the Google Spreadsheet you want to read
-# Example URL: https://docs.google.com/spreadsheets/d/SPREADSHEET_ID_HERE/edit#gid=0
-SPREADSHEET_ID = "1iR49Cx05EWtbG__o_-gl0SXvHgg5qNBhJ04q7HZN5dQ"      # <-- change this
-
-# Scopes: read-only is enough for this app
+SERVICE_ACCOUNT_FILE = "C:\\Users\\user-307E6E3400\\Desktop\\Python Scripts\\GS App\\keys\\endless-theorem-421101-fe0721f63c55.json"
+SPREADSHEET_ID = "1iR49Cx05EWtbG__o_-gl0SXvHgg5qNBhJ04q7HZN5dQ"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 # =========================================================
