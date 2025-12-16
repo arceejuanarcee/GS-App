@@ -12,7 +12,6 @@ SPREADSHEET_ID = "1iR49Cx05EWtbG__o_-gl0SXvHgg5qNBhJ04q7HZN5dQ"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 # ============================
 
-# ---------- SC CONVERTER LOGIC (from your Streamlit script) ----------
 
 def parse_command_line(line):
     """
