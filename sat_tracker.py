@@ -12,9 +12,10 @@ from skyfield.api import load, EarthSatellite, wgs84
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QSpinBox,
-    QMessageBox, QCheckBox, QGroupBox, QFormLayout, QTabWidget
+    QMessageBox, QCheckBox, QGroupBox, QFormLayout, QTabWidget,
+    QLineEdit, QHBoxLayout
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -27,7 +28,7 @@ SPACETRACK_PASS = "ArceeJuan123456789"
 SPACE_TRACK_LOGIN_URL = "https://www.space-track.org/ajaxauth/login"
 SPACE_TRACK_QUERY_BASE = "https://www.space-track.org/basicspacedata/query"
 
-SAT_IDS = [
+DEFAULT_SAT_IDS = [
     "43619", "27424", "31698", "37849", "54234", "43013",
     "14780", "25682", "39084", "49260", "43672", "23710",
     "43678", "25994"
@@ -42,6 +43,19 @@ class TLE:
     name: str
     line1: str
     line2: str
+
+
+def clean_sat_name(name: str) -> str:
+    """
+    Space-Track 3LE names often come like: "0 AQUA", "0 TERRA", etc.
+    We strip the leading '0 ' and normalize whitespace.
+    """
+    n = (name or "").strip()
+    if n.startswith("0 "):
+        n = n[2:].strip()
+    # collapse repeated spaces
+    n = " ".join(n.split())
+    return n or "UNKNOWN"
 
 
 # ----------------------------------------------------------
@@ -64,16 +78,18 @@ def spacetrack_login_session(timeout: int = 25) -> requests.Session:
 def parse_3le(text: str, fallback_name: str) -> Optional[Tuple[str, str, str]]:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 3 and lines[1].startswith("1 ") and lines[2].startswith("2 "):
-        return lines[0], lines[1], lines[2]
+        name = lines[0].strip() or fallback_name
+        return clean_sat_name(name), lines[1], lines[2]
     if len(lines) >= 2 and lines[0].startswith("1 ") and lines[1].startswith("2 "):
-        return fallback_name, lines[0], lines[1]
+        return clean_sat_name(fallback_name), lines[0], lines[1]
     return None
 
 
 def fetch_tle_latest(sess: requests.Session, norad: str) -> TLE:
+    # format/3le gives NAME + line1 + line2
     url = (
         f"{SPACE_TRACK_QUERY_BASE}/class/tle_latest/"
-        f"NORAD_CAT_ID/{norad}/ORDINAL/1/EPOCH/%3Enow-30/format/tle"
+        f"NORAD_CAT_ID/{norad}/ORDINAL/1/EPOCH/%3Enow-30/format/3le"
     )
     r = sess.get(url, timeout=25)
     r.raise_for_status()
@@ -95,19 +111,41 @@ def fetch_all_tles(norad_ids: List[str]) -> Dict[str, TLE]:
 
 
 # ----------------------------------------------------------
-# MAP (MAPBOX + ESRI SATELLITE IMAGERY) + LIVE HOOKS
+# Helpers: outlined text via 2 traces (black behind white)
+# ----------------------------------------------------------
+def add_outlined_text_mapbox(fig: go.Figure, lon: float, lat: float, text: str, pos: str):
+    # black outline layer (bigger)
+    fig.add_trace(go.Scattermapbox(
+        lon=[lon],
+        lat=[lat],
+        mode="text",
+        text=[text],
+        textposition=pos,
+        textfont=dict(size=16, color="black"),
+        showlegend=False,
+        hoverinfo="skip"
+    ))
+    # white top layer (smaller)
+    fig.add_trace(go.Scattermapbox(
+        lon=[lon],
+        lat=[lat],
+        mode="text",
+        text=[text],
+        textposition=pos,
+        textfont=dict(size=13, color="white"),
+        showlegend=False,
+        hoverinfo="skip"
+    ))
+
+
+# ----------------------------------------------------------
+# MAP (MAPBOX + ESRI SATELLITE) + LIVE HOOKS
 # ----------------------------------------------------------
 def build_map_html_with_live_hooks_mapbox(
     selected_tles: List[TLE],
     minutes_window: int,
     tail_len: int
 ) -> Tuple[str, List[dict]]:
-    """
-    Uses Mapbox with an ESRI World Imagery raster layer (satellite-style Earth).
-    Returns:
-      - HTML string
-      - sat_trace_meta (trace indices)
-    """
     ts = load.timescale()
     t_now = ts.now()
 
@@ -116,7 +154,6 @@ def build_map_html_with_live_hooks_mapbox(
     sun = eph["sun"]
     moon = eph["moon"]
 
-    # Sun/Moon subpoints (Earth-centered)
     sun_geo = earth.at(t_now).observe(sun).apparent()
     moon_geo = earth.at(t_now).observe(moon).apparent()
     sun_sp = wgs84.subpoint(sun_geo)
@@ -124,7 +161,6 @@ def build_map_html_with_live_hooks_mapbox(
 
     fig = go.Figure()
 
-    # Track times (static)
     base = datetime.utcnow()
     mins = np.arange(-minutes_window, minutes_window + 1, 1, dtype=int)
     dt_list = [base + timedelta(minutes=int(m)) for m in mins]
@@ -137,96 +173,144 @@ def build_map_html_with_live_hooks_mapbox(
         [d.second for d in dt_list],
     )
 
-    # Ground Station, Sun, Moon as scattermapbox
+    # Ground Station marker + label
     fig.add_trace(go.Scattermapbox(
         lon=[GROUND_STATION["lon"]],
         lat=[GROUND_STATION["lat"]],
-        mode="markers+text",
-        marker=dict(size=12),
-        text=[GROUND_STATION["name"]],
-        textposition="top right",
-        name="Ground Station"
+        mode="markers",
+        marker=dict(size=12, color="dodgerblue"),
+        name="Ground Station",
+        hovertext=[GROUND_STATION["name"]],
+        hoverinfo="text"
     ))
+    add_outlined_text_mapbox(
+        fig,
+        lon=float(GROUND_STATION["lon"]),
+        lat=float(GROUND_STATION["lat"]),
+        text=GROUND_STATION["name"],
+        pos="top right"
+    )
 
+    # Sun
     fig.add_trace(go.Scattermapbox(
-        lon=[sun_sp.longitude.degrees],
-        lat=[sun_sp.latitude.degrees],
-        mode="markers+text",
-        marker=dict(size=12),
-        text=["Sun"],
-        textposition="top center",
-        name="Sun"
+        lon=[float(sun_sp.longitude.degrees)],
+        lat=[float(sun_sp.latitude.degrees)],
+        mode="markers",
+        marker=dict(size=12, color="yellow"),
+        name="Sun",
+        hovertext=["Sun subpoint"],
+        hoverinfo="text"
     ))
+    add_outlined_text_mapbox(
+        fig,
+        lon=float(sun_sp.longitude.degrees),
+        lat=float(sun_sp.latitude.degrees),
+        text="Sun",
+        pos="top center"
+    )
 
+    # Moon
     fig.add_trace(go.Scattermapbox(
-        lon=[moon_sp.longitude.degrees],
-        lat=[moon_sp.latitude.degrees],
-        mode="markers+text",
-        marker=dict(size=12),
-        text=["Moon"],
-        textposition="top center",
-        name="Moon"
+        lon=[float(moon_sp.longitude.degrees)],
+        lat=[float(moon_sp.latitude.degrees)],
+        mode="markers",
+        marker=dict(size=12, color="white"),
+        name="Moon",
+        hovertext=["Moon subpoint"],
+        hoverinfo="text"
     ))
+    add_outlined_text_mapbox(
+        fig,
+        lon=float(moon_sp.longitude.degrees),
+        lat=float(moon_sp.latitude.degrees),
+        text="Moon",
+        pos="top center"
+    )
 
     sat_trace_meta: List[dict] = []
 
-    # Add satellites: static track + live tail + live marker
     for tle in selected_tles:
         sat = EarthSatellite(tle.line1, tle.line2, tle.name, ts)
 
         sp_track = sat.at(times).subpoint()
-        track_lons = sp_track.longitude.degrees
-        track_lats = sp_track.latitude.degrees
+        track_lons = sp_track.longitude.degrees.tolist()
+        track_lats = sp_track.latitude.degrees.tolist()
 
-        track_i = len(fig.data)
         fig.add_trace(go.Scattermapbox(
-            lon=track_lons.tolist(),
-            lat=track_lats.tolist(),
+            lon=track_lons,
+            lat=track_lats,
             mode="lines",
-            line=dict(width=2),
-            name=f"{tle.name} track"
+            line=dict(width=2, color="magenta"),
+            name=f"{tle.name} track",
+            hoverinfo="skip"
         ))
 
         sp_now = sat.at(t_now).subpoint()
         cur_lon = float(sp_now.longitude.degrees)
         cur_lat = float(sp_now.latitude.degrees)
 
+        # Tail (updated live)
         tail_i = len(fig.data)
         fig.add_trace(go.Scattermapbox(
             lon=[cur_lon],
             lat=[cur_lat],
             mode="lines",
-            line=dict(width=3),
-            name=f"{tle.name} tail"
+            line=dict(width=3, color="cyan"),
+            name=f"{tle.name} tail",
+            hoverinfo="skip",
+            showlegend=False
         ))
 
+        # Marker (updated live)
+        # ✅ FIX: remove marker line=... (unsupported in your plotly)
         marker_i = len(fig.data)
         fig.add_trace(go.Scattermapbox(
             lon=[cur_lon],
             lat=[cur_lat],
-            mode="markers+text",
-            marker=dict(size=10),
+            mode="markers",
+            marker=dict(size=10, color="cyan"),
+            name=tle.name,
+            hovertext=[f"{tle.name} (NORAD {tle.norad})"],
+            hoverinfo="text"
+        ))
+
+        # Label traces updated live (2 layers)
+        label_black_i = len(fig.data)
+        fig.add_trace(go.Scattermapbox(
+            lon=[cur_lon],
+            lat=[cur_lat],
+            mode="text",
             text=[tle.name],
             textposition="top center",
-            name=f"{tle.name} now"
+            textfont=dict(size=16, color="black"),
+            showlegend=False,
+            hoverinfo="skip"
+        ))
+        label_white_i = len(fig.data)
+        fig.add_trace(go.Scattermapbox(
+            lon=[cur_lon],
+            lat=[cur_lat],
+            mode="text",
+            text=[tle.name],
+            textposition="top center",
+            textfont=dict(size=13, color="white"),
+            showlegend=False,
+            hoverinfo="skip"
         ))
 
         sat_trace_meta.append({
             "norad": tle.norad,
-            "name": tle.name,
-            "track_i": track_i,
             "tail_i": tail_i,
-            "marker_i": marker_i
+            "marker_i": marker_i,
+            "label_black_i": label_black_i,
+            "label_white_i": label_white_i
         })
 
-    # --- Satellite imagery basemap using an ESRI raster layer ---
-    # Mapbox token not required because we use style="white-bg" + custom raster tiles.
-    # (Works without you needing to provide a token.)
     fig.update_layout(
         mapbox=dict(
             style="white-bg",
-            center=dict(lat=0, lon=0),
-            zoom=0.8,
+            center=dict(lat=10, lon=120),
+            zoom=1.4,
             layers=[
                 dict(
                     sourcetype="raster",
@@ -243,7 +327,6 @@ def build_map_html_with_live_hooks_mapbox(
     )
 
     div = plotly_plot(fig, output_type="div", include_plotlyjs="cdn")
-
     meta_json = json.dumps(sat_trace_meta)
     tail_len_js = int(tail_len)
 
@@ -260,7 +343,6 @@ def build_map_html_with_live_hooks_mapbox(
       </head>
       <body>
         <div id="wrap">{div}</div>
-
         <script>
           function getPlotDiv() {{
             return document.querySelector('.plotly-graph-div');
@@ -299,12 +381,11 @@ def build_map_html_with_live_hooks_mapbox(
             const s = SAT_META.find(x => x.norad === norad);
             if (!s) return;
 
-            // Update marker (single point)
-            Plotly.restyle(plotDiv, {{ lon: [[lon]], lat: [[lat]] }}, [s.marker_i]);
-
-            // Update tail line
             const b = tailBuffers[norad];
             Plotly.restyle(plotDiv, {{ lon: [b.lons], lat: [b.lats] }}, [s.tail_i]);
+            Plotly.restyle(plotDiv, {{ lon: [[lon]], lat: [[lat]] }}, [s.marker_i]);
+            Plotly.restyle(plotDiv, {{ lon: [[lon]], lat: [[lat]] }}, [s.label_black_i]);
+            Plotly.restyle(plotDiv, {{ lon: [[lon]], lat: [[lat]] }}, [s.label_white_i]);
           }}
 
           window.resetTails = function() {{
@@ -338,12 +419,11 @@ class MainWindow(QMainWindow):
         self.live_timer.timeout.connect(self.live_tick)
 
         self.web_loaded = False
+        self.sat_ids: List[str] = list(DEFAULT_SAT_IDS)
 
-        # --- Tabs root ---
         tabs = QTabWidget()
         self.setCentralWidget(tabs)
 
-        # TAB 1: VIEW (map only)
         view_tab = QWidget()
         view_layout = QVBoxLayout(view_tab)
         self.web = QWebEngineView()
@@ -351,15 +431,24 @@ class MainWindow(QMainWindow):
         view_layout.addWidget(self.web)
         tabs.addTab(view_tab, "View")
 
-        # TAB 2: CONTROLS (no map)
         controls_tab = QWidget()
         controls_layout = QVBoxLayout(controls_tab)
 
         controls_group = QGroupBox("Controls / Settings")
         form = QFormLayout(controls_group)
 
-        self.btn_fetch = QPushButton("Fetch TLEs (SAT_IDS)")
+        self.btn_fetch = QPushButton("Fetch TLEs (Current NORAD List)")
         self.btn_fetch.clicked.connect(self.fetch_tles)
+
+        add_row = QWidget()
+        add_row_layout = QHBoxLayout(add_row)
+        add_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.add_norad_input = QLineEdit()
+        self.add_norad_input.setPlaceholderText("Add NORAD IDs e.g. 25544 or 25544, 43205")
+        self.btn_add_norad = QPushButton("Add NORAD IDs")
+        self.btn_add_norad.clicked.connect(self.add_norad_ids)
+        add_row_layout.addWidget(self.add_norad_input, 1)
+        add_row_layout.addWidget(self.btn_add_norad)
 
         self.track_window = QSpinBox()
         self.track_window.setRange(5, 180)
@@ -380,6 +469,7 @@ class MainWindow(QMainWindow):
         self.live_interval.setValue(1000)
 
         form.addRow(self.btn_fetch)
+        form.addRow("Add satellites by NORAD:", add_row)
         form.addRow("Track window (min):", self.track_window)
         form.addRow("Tail length (points):", self.tail_len)
         form.addRow(self.btn_render)
@@ -404,10 +494,49 @@ class MainWindow(QMainWindow):
     def set_status(self, msg: str):
         self.status.setText(msg)
 
+    def _normalize_norad(self, s: str) -> Optional[str]:
+        s = s.strip()
+        if not s:
+            return None
+        if not s.isdigit():
+            return None
+        return s
+
+    def add_norad_ids(self):
+        raw = self.add_norad_input.text().strip()
+        if not raw:
+            return
+
+        parts = [p.strip() for p in raw.replace(";", ",").split(",")]
+        added, bad = [], []
+
+        for p in parts:
+            if not p:
+                continue
+            norad = self._normalize_norad(p)
+            if not norad:
+                bad.append(p)
+                continue
+            if norad not in self.sat_ids:
+                self.sat_ids.append(norad)
+                added.append(norad)
+
+        self.add_norad_input.clear()
+
+        msg = []
+        if added:
+            msg.append(f"Added: {', '.join(added)}")
+        if bad:
+            msg.append(f"Ignored (invalid): {', '.join(bad)}")
+        if not msg:
+            msg = ["No new NORAD IDs added (already in list)."]
+
+        QMessageBox.information(self, "NORAD IDs Update", "\n".join(msg))
+
     def fetch_tles(self):
         try:
-            self.set_status("Fetching TLEs from Space-Track...")
-            self.tle_store = fetch_all_tles(SAT_IDS)
+            self.set_status("Fetching TLEs from Space-Track (3LE names, cleaned)...")
+            self.tle_store = fetch_all_tles(self.sat_ids)
 
             self.list_widget.clear()
             for norad, tle in sorted(self.tle_store.items(), key=lambda x: x[1].name.upper()):
@@ -418,7 +547,7 @@ class MainWindow(QMainWindow):
             for i in range(self.list_widget.count()):
                 self.list_widget.item(i).setSelected(True)
 
-            self.set_status("TLEs loaded. Select satellites then click Render Selected.")
+            self.set_status(f"TLEs loaded: {len(self.tle_store)} satellites. Render when ready.")
         except Exception as e:
             QMessageBox.critical(self, "Fetch failed", str(e))
             self.set_status("Fetch failed.")
@@ -453,7 +582,6 @@ class MainWindow(QMainWindow):
                 minutes_window=int(self.track_window.value()),
                 tail_len=int(self.tail_len.value())
             )
-
             self.web.setHtml(page)
         except Exception as e:
             QMessageBox.critical(self, "Render failed", str(e))
@@ -477,7 +605,6 @@ class MainWindow(QMainWindow):
     def live_tick(self):
         if not self.web_loaded or not self.selected_norads:
             return
-
         try:
             t_now = self.ts.now()
             for norad in self.selected_norads:
