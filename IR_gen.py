@@ -1,4 +1,5 @@
 import io
+import re
 from datetime import date, datetime
 
 import pandas as pd
@@ -61,11 +62,13 @@ def _append_figures_after_heading(
             fig_no = figure_start
 
             for idx, f in enumerate(files):
+                # Image paragraph
                 img_p = _insert_paragraph_after(anchor)
                 img_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = img_p.add_run()
                 run.add_picture(io.BytesIO(f.getvalue()), width=Inches(STANDARD_IMAGE_WIDTH_IN))
 
+                # Caption paragraph
                 caption_text = ""
                 if captions and idx < len(captions):
                     caption_text = (captions[idx] or "").strip()
@@ -74,9 +77,7 @@ def _append_figures_after_heading(
 
                 cap_p = _insert_paragraph_after(img_p)
                 cap_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                cap_run = cap_p.add_run(
-                    f"Figure {fig_no}. {section_label} – {caption_text}"
-                )
+                cap_run = cap_p.add_run(f"Figure {fig_no}. {section_label} – {caption_text}")
                 cap_run.italic = True
 
                 anchor = cap_p
@@ -110,24 +111,28 @@ def generate_docx(data):
 
     t0, t1, t2, t3 = doc.tables[0], doc.tables[1], doc.tables[2], doc.tables[3]
 
+    # Header tables
     _set_2col_table_value(t0, "Reported by", data["reported_by"])
     _set_2col_table_value(t0, "Position", data["position"])
     _set_2col_table_value(t0, "Date of Report", data["date_of_report"])
-    _set_2col_table_value(t0, "Incident No.", data["incident_no"])
+    _set_2col_table_value(t0, "Incident No.", data["full_incident_no"])
 
     _set_2col_table_value(t1, "Date (YYYY-MM-DD)", data["incident_date"])
     _set_2col_table_value(t1, "Time", data["incident_time"])
     _set_2col_table_value(t1, "Location", data["location"])
     _set_2col_table_value(t1, "Current Status", data["current_status"])
 
+    # Text sections
     _set_paragraph_after_heading(doc, "Nature of Incident", data["nature"])
     _set_paragraph_after_heading(doc, "Damages Incurred (if any)", data["damages"])
     _set_paragraph_after_heading(doc, "Investigation and Analysis", data["investigation"])
     _set_paragraph_after_heading(doc, "Conclusion and Recommendations", data["conclusion"])
 
+    # Tables
     _fill_sequence_table(t2, data["sequence_df"])
     _fill_actions_table(t3, data["actions_df"])
 
+    # Figures (continuous numbering)
     fig = 1
     fig = _append_figures_after_heading(doc, "Sequence of Events", data["sequence_images"], data["sequence_captions"], fig, "Sequence of Events")
     fig = _append_figures_after_heading(doc, "Damages Incurred (if any)", data["damages_images"], data["damages_captions"], fig, "Damages Incurred")
@@ -143,14 +148,22 @@ def generate_docx(data):
 def captions_editor(files, key):
     if not files:
         return []
-    df = pd.DataFrame(
-        {
-            "File": [f.name for f in files],
-            "Caption": ["" for _ in files],
-        }
-    )
+    df = pd.DataFrame({"File": [f.name for f in files], "Caption": ["" for _ in files]})
     edited = st.data_editor(df, key=key, num_rows="fixed", use_container_width=True)
     return edited["Caption"].tolist()
+
+def normalize_serial(serial_raw: str) -> str:
+    """
+    Accepts: '1', '01', '001', '0001', '12', '0012' etc.
+    Outputs: '0001' (always 4 digits).
+    Rejects non-numeric.
+    """
+    s = (serial_raw or "").strip()
+    if not s:
+        return ""
+    if not re.fullmatch(r"\d{1,4}", s):
+        return ""
+    return s.zfill(4)
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="IR Generator", layout="wide")
@@ -158,11 +171,22 @@ st.title("Incident Report Generator")
 
 year = st.selectbox("Year", [datetime.now().year, datetime.now().year - 1])
 city = st.selectbox("City", list(CITY_CODES.keys()))
+site_code = CITY_CODES[city]
 
-# USER-INPUT Incident No.
-incident_no = st.text_input(
-    "Incident No.",
-    placeholder="e.g. SMCOD-IR-GS-DVO-2026-0001"
+# User inputs only serial
+serial_raw = st.text_input(
+    "Incident serial (000#)",
+    placeholder="e.g. 0001",
+    help="Enter only the serial part. Example: 0001 (or just 1; it will auto-format to 0001)."
+)
+
+serial = normalize_serial(serial_raw)
+full_incident_no = f"SMCOD-IR-GS-{site_code}-{year}-{serial}" if serial else ""
+
+st.text_input(
+    "Full Incident No. (auto-built)",
+    value=full_incident_no,
+    disabled=True
 )
 
 with st.form("ir_form"):
@@ -212,15 +236,15 @@ with st.form("ir_form"):
     submit = st.form_submit_button("Generate Report")
 
 if submit:
-    if not incident_no.strip():
-        st.error("Incident No. is required.")
+    if not serial:
+        st.error("Please enter a valid incident serial (numbers only, up to 4 digits). Example: 0001 or 1.")
         st.stop()
 
     data = {
         "reported_by": reported_by,
         "position": position,
         "date_of_report": date_of_report,
-        "incident_no": incident_no,
+        "full_incident_no": full_incident_no,
         "incident_date": incident_date,
         "incident_time": incident_time,
         "location": location,
@@ -247,6 +271,6 @@ if submit:
     st.download_button(
         "Download Incident Report (DOCX)",
         data=docx_bytes,
-        file_name=f"{incident_no}.docx",
+        file_name=f"{full_incident_no}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
