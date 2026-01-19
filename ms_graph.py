@@ -1,7 +1,12 @@
 import streamlit as st
 import msal
 
-SCOPES = ["User.Read", "Files.ReadWrite.All", "Sites.ReadWrite.All", "offline_access"]
+# Do NOT include: "openid", "profile", "offline_access"
+SCOPES = [
+    "User.Read",
+    "Files.ReadWrite.All",
+    "Sites.ReadWrite.All",
+]
 
 def _cfg():
     return st.secrets["ms_graph"]
@@ -16,8 +21,8 @@ def build_msal_app():
 
 def login_ui():
     """
-    Renders a login link, and if redirected back with ?code=..., exchanges it for a token.
-    Stores result in st.session_state['ms_token'].
+    Renders a login link, and exchanges ?code=... for tokens.
+    Stores tokens in st.session_state['ms_token'].
     """
     st.session_state.setdefault("ms_flow", None)
 
@@ -32,9 +37,9 @@ def login_ui():
     flow = st.session_state["ms_flow"]
     st.markdown(f"[Login to Microsoft]({flow['auth_uri']})")
 
-    # Streamlit provides query params as a dict-like
     params = dict(st.query_params)
 
+    # When redirected back, the URL will contain ?code=...&state=...
     if "code" in params and "ms_token" not in st.session_state:
         result = app.acquire_token_by_auth_code_flow(flow, params)
         if "access_token" not in result:
