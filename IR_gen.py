@@ -5,6 +5,8 @@ import pandas as pd
 import streamlit as st
 from docx import Document
 from docx.shared import Inches
+from docx.oxml import OxmlElement
+from docx.text.paragraph import Paragraph
 
 # ---------------- CONFIG ----------------
 TEMPLATE_PATH = "Incident Report Template_blank (1).docx"
@@ -34,22 +36,42 @@ def _set_paragraph_after_heading(doc, heading_text, new_text):
                 doc.paragraphs[i + 1].text = new_text or ""
             return
 
+def _insert_paragraph_after(paragraph):
+    """
+    Insert a new empty paragraph after the given paragraph and return it.
+    python-docx does NOT provide insert_paragraph_after() publicly.
+    """
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    return Paragraph(new_p, paragraph._parent)
+
 def _append_images_after_heading(doc, heading_text, files, width=5.5):
+    """
+    Appends uploaded images under a given heading by inserting new paragraphs
+    after the body paragraph that follows the heading (or after heading if none).
+    """
     if not files:
         return
+
     for i, p in enumerate(doc.paragraphs):
         if p.text.strip() == heading_text.strip():
-            anchor = doc.paragraphs[min(i + 1, len(doc.paragraphs) - 1)]
+            # place images after the paragraph right after the heading if it exists
+            anchor = doc.paragraphs[i + 1] if i + 1 < len(doc.paragraphs) else p
+
             for f in files:
                 img_bytes = f.getvalue()
-                new_p = anchor.insert_paragraph_after()
+                new_p = _insert_paragraph_after(anchor)
                 run = new_p.add_run()
                 run.add_picture(io.BytesIO(img_bytes), width=Inches(width))
                 anchor = new_p
+
             return
 
 def _fill_sequence_table(table, df):
+    # Your template's Sequence of Events table has no header row (based on your earlier script),
+    # so we clear all rows first.
     _clear_table_rows_except_header(table, header_rows=0)
+
     for _, r in df.iterrows():
         cells = table.add_row().cells
         cells[0].text = str(r.get("Date", ""))
@@ -58,7 +80,9 @@ def _fill_sequence_table(table, df):
         cells[3].text = str(r.get("Message", ""))
 
 def _fill_actions_table(table, df):
+    # Actions table has a header row in the template
     _clear_table_rows_except_header(table, header_rows=1)
+
     for _, r in df.iterrows():
         cells = table.add_row().cells
         cells[0].text = str(r.get("Date", ""))
@@ -70,6 +94,11 @@ def _fill_actions_table(table, df):
 def generate_docx(data):
     doc = Document(TEMPLATE_PATH)
 
+    # Assumes template table order:
+    # 0: Report header table
+    # 1: Incident details table
+    # 2: Sequence of events table
+    # 3: Response/actions table
     t0, t1, t2, t3 = doc.tables[0], doc.tables[1], doc.tables[2], doc.tables[3]
 
     # Header tables
@@ -93,7 +122,7 @@ def generate_docx(data):
     _fill_sequence_table(t2, data["sequence_df"])
     _fill_actions_table(t3, data["actions_df"])
 
-    # Images
+    # Images (inserted under headings)
     _append_images_after_heading(doc, "Sequence of Events", data["sequence_images"])
     _append_images_after_heading(doc, "Damages Incurred (if any)", data["damages_images"])
     _append_images_after_heading(doc, "Investigation and Analysis", data["investigation_images"])
