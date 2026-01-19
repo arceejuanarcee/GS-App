@@ -17,7 +17,6 @@ CITY_CODES = {
     "Quezon City": "QZN",
 }
 
-# FIXED standard image width (inches)
 STANDARD_IMAGE_WIDTH_IN = 5.5
 
 # ---------------- DOCX HELPERS ----------------
@@ -47,11 +46,11 @@ def _insert_paragraph_after(paragraph):
 
 def _append_figures_after_heading(
     doc,
-    heading_text: str,
-    files: list,
-    captions: list[str],
-    figure_start: int,
-    section_label: str,
+    heading_text,
+    files,
+    captions,
+    figure_start,
+    section_label,
 ):
     if not files:
         return figure_start
@@ -59,22 +58,19 @@ def _append_figures_after_heading(
     for i, p in enumerate(doc.paragraphs):
         if p.text.strip() == heading_text.strip():
             anchor = doc.paragraphs[i + 1] if i + 1 < len(doc.paragraphs) else p
-
             fig_no = figure_start
+
             for idx, f in enumerate(files):
-                # --- Image ---
                 img_p = _insert_paragraph_after(anchor)
                 img_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = img_p.add_run()
                 run.add_picture(io.BytesIO(f.getvalue()), width=Inches(STANDARD_IMAGE_WIDTH_IN))
 
-                # --- Caption ---
                 caption_text = ""
                 if captions and idx < len(captions):
                     caption_text = (captions[idx] or "").strip()
-
                 if not caption_text:
-                    caption_text = getattr(f, "name", "Photo").rsplit(".", 1)[0]
+                    caption_text = f.name.rsplit(".", 1)[0]
 
                 cap_p = _insert_paragraph_after(img_p)
                 cap_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -162,11 +158,12 @@ st.title("Incident Report Generator")
 
 year = st.selectbox("Year", [datetime.now().year, datetime.now().year - 1])
 city = st.selectbox("City", list(CITY_CODES.keys()))
-site_code = CITY_CODES[city]
 
-st.session_state.setdefault("ir_counter", 1)
-incident_no = f"SMCOD-IR-GS-{site_code}-{year}-{st.session_state['ir_counter']:04d}"
-st.text_input("Incident No.", value=incident_no, disabled=True)
+# USER-INPUT Incident No.
+incident_no = st.text_input(
+    "Incident No.",
+    placeholder="e.g. SMCOD-IR-GS-DVO-2026-0001"
+)
 
 with st.form("ir_form"):
     c1, c2 = st.columns(2)
@@ -215,6 +212,10 @@ with st.form("ir_form"):
     submit = st.form_submit_button("Generate Report")
 
 if submit:
+    if not incident_no.strip():
+        st.error("Incident No. is required.")
+        st.stop()
+
     data = {
         "reported_by": reported_by,
         "position": position,
@@ -241,7 +242,6 @@ if submit:
     }
 
     docx_bytes = generate_docx(data)
-    st.session_state["ir_counter"] += 1
 
     st.success("Incident Report generated.")
     st.download_button(
