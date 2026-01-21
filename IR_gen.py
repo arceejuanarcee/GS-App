@@ -10,6 +10,9 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.text.paragraph import Paragraph
 
+import ms_graph
+import sp_folder_graph as spg
+
 # ---------------- CONFIG ----------------
 TEMPLATE_PATH = "Incident Report Template_blank (1).docx"
 
@@ -19,6 +22,19 @@ CITY_CODES = {
 }
 
 STANDARD_IMAGE_WIDTH_IN = 5.5
+
+# SharePoint SITE URL (NOT the share link). Use your real site.
+# Example:
+#   https://philsagov.sharepoint.com/sites/SMCOD
+SHAREPOINT_SITE_URL = st.secrets.get("sharepoint", {}).get("site_url", "")
+
+# Path inside the document library/drive root to the Incident Reports folder:
+# Based on your screenshot breadcrumb:
+# SMCOD > Documents > Ground Station Operations > Installations, Maintenance and Repair > Incident Reports
+INCIDENT_REPORTS_ROOT_PATH = st.secrets.get("sharepoint", {}).get(
+    "incident_reports_root_path",
+    "Ground Station Operations/Installations, Maintenance and Repair/Incident Reports"
+)
 
 # ---------------- DOCX HELPERS ----------------
 def _clear_table_rows_except_header(table, header_rows=1):
@@ -45,14 +61,7 @@ def _insert_paragraph_after(paragraph):
     paragraph._p.addnext(new_p)
     return Paragraph(new_p, paragraph._parent)
 
-def _append_figures_after_heading(
-    doc,
-    heading_text,
-    files,
-    captions,
-    figure_start,
-    section_label,
-):
+def _append_figures_after_heading(doc, heading_text, files, captions, figure_start, section_label):
     if not files:
         return figure_start
 
@@ -62,18 +71,16 @@ def _append_figures_after_heading(
             fig_no = figure_start
 
             for idx, f in enumerate(files):
-                # Image paragraph
                 img_p = _insert_paragraph_after(anchor)
                 img_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = img_p.add_run()
                 run.add_picture(io.BytesIO(f.getvalue()), width=Inches(STANDARD_IMAGE_WIDTH_IN))
 
-                # Caption paragraph
                 caption_text = ""
                 if captions and idx < len(captions):
                     caption_text = (captions[idx] or "").strip()
                 if not caption_text:
-                    caption_text = f.name.rsplit(".", 1)[0]
+                    caption_text = getattr(f, "name", "Photo").rsplit(".", 1)[0]
 
                 cap_p = _insert_paragraph_after(img_p)
                 cap_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -84,7 +91,6 @@ def _append_figures_after_heading(
                 fig_no += 1
 
             return fig_no
-
     return figure_start
 
 def _fill_sequence_table(table, df):
@@ -108,10 +114,8 @@ def _fill_actions_table(table, df):
 
 def generate_docx(data):
     doc = Document(TEMPLATE_PATH)
-
     t0, t1, t2, t3 = doc.tables[0], doc.tables[1], doc.tables[2], doc.tables[3]
 
-    # Header tables
     _set_2col_table_value(t0, "Reported by", data["reported_by"])
     _set_2col_table_value(t0, "Position", data["position"])
     _set_2col_table_value(t0, "Date of Report", data["date_of_report"])
@@ -122,17 +126,14 @@ def generate_docx(data):
     _set_2col_table_value(t1, "Location", data["location"])
     _set_2col_table_value(t1, "Current Status", data["current_status"])
 
-    # Text sections
     _set_paragraph_after_heading(doc, "Nature of Incident", data["nature"])
     _set_paragraph_after_heading(doc, "Damages Incurred (if any)", data["damages"])
     _set_paragraph_after_heading(doc, "Investigation and Analysis", data["investigation"])
     _set_paragraph_after_heading(doc, "Conclusion and Recommendations", data["conclusion"])
 
-    # Tables
     _fill_sequence_table(t2, data["sequence_df"])
     _fill_actions_table(t3, data["actions_df"])
 
-    # Figures (continuous numbering)
     fig = 1
     fig = _append_figures_after_heading(doc, "Sequence of Events", data["sequence_images"], data["sequence_captions"], fig, "Sequence of Events")
     fig = _append_figures_after_heading(doc, "Damages Incurred (if any)", data["damages_images"], data["damages_captions"], fig, "Damages Incurred")
@@ -144,7 +145,6 @@ def generate_docx(data):
     out.seek(0)
     return out.read()
 
-# ---------------- UI HELPERS ----------------
 def captions_editor(files, key):
     if not files:
         return []
@@ -153,11 +153,6 @@ def captions_editor(files, key):
     return edited["Caption"].tolist()
 
 def normalize_serial(serial_raw: str) -> str:
-    """
-    Accepts: '1', '01', '001', '0001', '12', '0012' etc.
-    Outputs: '0001' (always 4 digits).
-    Rejects non-numeric.
-    """
     s = (serial_raw or "").strip()
     if not s:
         return ""
@@ -169,25 +164,65 @@ def normalize_serial(serial_raw: str) -> str:
 st.set_page_config(page_title="IR Generator", layout="wide")
 st.title("Incident Report Generator")
 
-year = st.selectbox("Year", [datetime.now().year, datetime.now().year - 1])
+# Choose scopes
+mode = st.radio("Graph mode", ["Read-only (no upload)", "Write (create folders/upload)"], horizontal=True)
+scopes = ms_graph.DEFAULT_SCOPES_READONLY if mode.startswith("Read-only") else ms_graph.DEFAULT_SCOPES_WRITE
+
+# Login
+ms_graph.login_ui(scopes=scopes)
+access_token = ms_graph.get_access_token()
+if not access_token:
+    st.stop()
+
+if not SHAREPOINT_SITE_URL:
+    st.error("Missing sharepoint.site_url in Streamlit secrets.")
+    st.stop()
+
+# Resolve site & drive once
+if "sp_site_id" not in st.session_state or "sp_drive_id" not in st.session_state:
+    with st.spinner("Resolving SharePoint site/drive..."):
+        st.session_state["sp_site_id"] = spg.resolve_site_id(access_token, SHAREPOINT_SITE_URL)
+        st.session_state["sp_drive_id"] = spg.get_default_drive_id(access_token, st.session_state["sp_site_id"])
+
+drive_id = st.session_state["sp_drive_id"]
+
+# Year / City selection based on your structure
+this_year = str(datetime.now().year)
+year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)])
+
 city = st.selectbox("City", list(CITY_CODES.keys()))
 site_code = CITY_CODES[city]
 
-# User inputs only serial
-serial_raw = st.text_input(
-    "Incident serial (000#)",
-    placeholder="e.g. 0001",
-    help="Enter only the serial part. Example: 0001 (or just 1; it will auto-format to 0001)."
-)
+# Suggest next serial / duplicate check
+cA, cB, cC = st.columns([1, 1, 2])
+with cA:
+    if st.button("Suggest next serial"):
+        try:
+            next_serial = spg.suggest_next_ir(access_token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, site_code)
+            st.session_state["serial_raw"] = next_serial
+            st.success(f"Suggested: {next_serial}")
+        except Exception as e:
+            st.error(str(e))
 
+serial_raw = st.text_input("Incident serial (000#)", value=st.session_state.get("serial_raw", ""), placeholder="e.g. 0001")
 serial = normalize_serial(serial_raw)
-full_incident_no = f"SMCOD-IR-GS-{site_code}-{year}-{serial}" if serial else ""
 
-st.text_input(
-    "Full Incident No. (auto-built)",
-    value=full_incident_no,
-    disabled=True
-)
+full_incident_no = f"SMCOD-IR-GS-{site_code}-{year}-{serial}" if serial else ""
+st.text_input("Full Incident No. (auto)", value=full_incident_no, disabled=True)
+
+with cB:
+    if st.button("Check duplicate"):
+        if not serial:
+            st.warning("Enter a valid serial first.")
+        else:
+            try:
+                dup = spg.check_duplicate_ir(access_token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, full_incident_no)
+                if dup:
+                    st.error("Duplicate found: folder already exists.")
+                else:
+                    st.success("No duplicate folder found.")
+            except Exception as e:
+                st.error(str(e))
 
 with st.form("ir_form"):
     c1, c2 = st.columns(2)
@@ -233,12 +268,21 @@ with st.form("ir_form"):
         use_container_width=True,
     )
 
+    do_upload = st.checkbox("After generating, create IR folder and upload DOCX + images (requires Write consent)")
     submit = st.form_submit_button("Generate Report")
 
 if submit:
     if not serial:
-        st.error("Please enter a valid incident serial (numbers only, up to 4 digits). Example: 0001 or 1.")
+        st.error("Enter a valid incident serial (numbers only up to 4 digits).")
         st.stop()
+
+    # Optional: check duplicate before generating
+    try:
+        if spg.check_duplicate_ir(access_token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, full_incident_no):
+            st.error("Duplicate found: IR folder already exists. Choose a new serial.")
+            st.stop()
+    except Exception as e:
+        st.warning(f"Duplicate check skipped (error): {e}")
 
     data = {
         "reported_by": reported_by,
@@ -274,3 +318,47 @@ if submit:
         file_name=f"{full_incident_no}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+    if do_upload:
+        try:
+            # Ensure folders: {year}/{city}/{IR_FOLDER}
+            # Root: .../Incident Reports
+            final_folder = spg.ensure_path(
+                access_token,
+                drive_id,
+                INCIDENT_REPORTS_ROOT_PATH,
+                parts=[year, city, full_incident_no],
+            )
+
+            # Upload DOCX
+            spg.upload_file_to_folder(
+                access_token,
+                drive_id,
+                final_folder["id"],
+                filename=f"{full_incident_no}.docx",
+                content_bytes=docx_bytes,
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+            # Upload images (if any) to same IR folder
+            # (optional naming)
+            def upload_images(prefix, files):
+                for idx, f in enumerate(files or [], start=1):
+                    ext = (f.name.rsplit(".", 1)[-1] or "jpg").lower()
+                    spg.upload_file_to_folder(
+                        access_token,
+                        drive_id,
+                        final_folder["id"],
+                        filename=f"{prefix}_{idx:02d}.{ext}",
+                        content_bytes=f.getvalue(),
+                        content_type="image/jpeg" if ext in ["jpg", "jpeg"] else "image/png",
+                    )
+
+            upload_images("sequence", seq_imgs)
+            upload_images("damages", dmg_imgs)
+            upload_images("investigation", inv_imgs)
+            upload_images("conclusion", con_imgs)
+
+            st.success("Uploaded to SharePoint IR folder successfully.")
+        except Exception as e:
+            st.error(f"Upload failed: {e}")
