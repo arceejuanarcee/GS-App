@@ -60,9 +60,11 @@ def login_ui(scopes=None):
     """
     Streamlit Cloud friendly auth flow.
     Key behavior:
-      - Always shows a single auth link (user should use same tab)
-      - If callback arrives but flow missing, it restarts flow automatically
+      - Uses a SAME-TAB redirect button (no new tabs)
+      - If callback arrives but flow missing, restarts cleanly
     """
+    import streamlit.components.v1 as components
+
     app = _msal_app()
 
     if scopes is None:
@@ -79,54 +81,57 @@ def login_ui(scopes=None):
 
     # --- CALLBACK ---
     if "code" in qp:
-        # If flow missing, recreate flow and ask user to sign in again.
-        # We cannot safely redeem an auth code without the original flow state.
         flow = st.session_state.get("ms_flow")
         if not flow:
             st.warning(
-                "Login callback received but session state was lost (Streamlit Cloud behavior). "
-                "Please click the sign-in link again (same tab)."
-            )
-            # Clear the old callback params, restart flow
-            _reset_login_state(clear_url=True)
-            flow = _ensure_flow(app, scopes)
-            st.markdown(f"[Sign in with Microsoft]({flow['auth_uri']})")
-            st.stop()
-
-        try:
-            auth_response = {k: qp.get(k) for k in qp.keys()}
-            result = app.acquire_token_by_auth_code_flow(flow, auth_response)
-        except ValueError as e:
-            # state mismatch or other flow errors
-            st.warning(
-                f"Login interrupted ({str(e)}). Please sign in again and avoid multiple tabs/refresh."
+                "Login callback received but session state was lost. "
+                "Click Sign in again (same tab)."
             )
             _reset_login_state(clear_url=True)
-            flow = _ensure_flow(app, scopes)
-            st.markdown(f"[Sign in with Microsoft]({flow['auth_uri']})")
-            st.stop()
+            # fall through to start login again
 
-        if "access_token" in result:
-            st.session_state["ms_token"] = result
-            try:
-                st.query_params.clear()
-            except Exception:
-                pass
-            st.success("Login successful.")
-            st.rerun()
         else:
-            st.error(f"Login failed: {result.get('error')} - {result.get('error_description')}")
-            _reset_login_state(clear_url=True)
-            flow = _ensure_flow(app, scopes)
-            st.markdown(f"[Sign in with Microsoft]({flow['auth_uri']})")
-            st.stop()
+            try:
+                auth_response = {k: qp.get(k) for k in qp.keys()}
+                result = app.acquire_token_by_auth_code_flow(flow, auth_response)
+            except ValueError as e:
+                st.warning(f"Login interrupted ({str(e)}). Please sign in again.")
+                _reset_login_state(clear_url=True)
+                # fall through to start login again
+            else:
+                if "access_token" in result:
+                    st.session_state["ms_token"] = result
+                    try:
+                        st.query_params.clear()
+                    except Exception:
+                        pass
+                    st.success("Login successful.")
+                    st.rerun()
+                else:
+                    st.error(f"Login failed: {result.get('error')} - {result.get('error_description')}")
+                    _reset_login_state(clear_url=True)
+                    # fall through to start login again
 
-    # --- START LOGIN ---
+    # --- START LOGIN (SAME TAB) ---
     flow = _ensure_flow(app, scopes)
+    auth_url = flow["auth_uri"]
 
     st.markdown("### Microsoft Sign-in required")
-    st.caption("Important: Use the sign-in link in the SAME tab. Avoid refresh while signing in.")
-    st.markdown(f"[Sign in with Microsoft]({flow['auth_uri']})")
+    st.caption("This button will open Microsoft sign-in in the SAME tab (prevents session loss).")
+
+    if st.button("Sign in with Microsoft (same tab)"):
+        # Force same-tab navigation (no new tab)
+        components.html(
+            f"""
+            <script>
+              window.top.location.href = "{auth_url}";
+            </script>
+            """,
+            height=0,
+        )
+
+    st.caption("If nothing happens, your browser may block redirects. Try allowing redirects/popups for this site.")
+
 
 def get_access_token():
     token = st.session_state.get("ms_token")
