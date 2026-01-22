@@ -4,7 +4,6 @@ import json
 import base64
 import streamlit as st
 import msal
-import streamlit.components.v1 as components
 
 DEFAULT_SCOPES_READONLY = ["User.Read", "Sites.Read.All"]
 DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]
@@ -12,8 +11,16 @@ DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]
 _FLOW_QP_KEY = "ms_flow_b64"
 
 
-def _cfg():
-    # NEVER use st.secrets["..."] to avoid KeyError on import or missing keys.
+def _cfg() -> dict:
+    """
+    Read config safely (no KeyError).
+    Expected secrets:
+      [ms_graph]
+      client_id = "..."
+      client_secret = "..."
+      tenant_id = "..."
+      redirect_uri = "https://<app>.streamlit.app/"
+    """
     s = st.secrets.get("ms_graph", {})
     tenant_id = s.get("tenant_id") or os.getenv("MS_TENANT_ID", "")
     client_id = s.get("client_id") or os.getenv("MS_CLIENT_ID", "")
@@ -25,24 +32,24 @@ def _cfg():
         authority = f"https://login.microsoftonline.com/{tenant_id}"
 
     return {
+        "tenant_id": tenant_id,
         "client_id": client_id,
         "client_secret": client_secret,
-        "tenant_id": tenant_id,
         "redirect_uri": redirect_uri,
         "authority": authority or "",
     }
 
 
-def _require_cfg():
+def _require_cfg() -> dict:
     cfg = _cfg()
-    missing = [k for k in ["client_id", "client_secret", "tenant_id", "redirect_uri", "authority"] if not cfg.get(k)]
+    missing = [k for k in ["tenant_id", "client_id", "client_secret", "redirect_uri", "authority"] if not cfg.get(k)]
     if missing:
-        st.error("Microsoft Graph config is missing in Streamlit secrets: " + ", ".join(missing))
+        st.error("Missing MS Graph config in secrets: " + ", ".join(missing))
         st.stop()
     return cfg
 
 
-def _msal_app():
+def _msal_app() -> msal.ConfidentialClientApplication:
     cfg = _require_cfg()
     return msal.ConfidentialClientApplication(
         client_id=cfg["client_id"],
@@ -57,14 +64,13 @@ def _b64e(obj: dict) -> str:
 
 
 def _b64d(s: str) -> dict:
-    # Padding-safe decode
     s = (s or "").strip()
     pad = "=" * (-len(s) % 4)
     raw = base64.urlsafe_b64decode((s + pad).encode("utf-8"))
     return json.loads(raw.decode("utf-8"))
 
 
-def _reset_login_state(clear_url=True):
+def _reset_login_state(clear_url: bool = True) -> None:
     for k in ["ms_flow", "ms_token", "ms_scopes"]:
         st.session_state.pop(k, None)
 
@@ -75,23 +81,23 @@ def _reset_login_state(clear_url=True):
             pass
 
 
-def logout():
+def logout() -> None:
     _reset_login_state(clear_url=True)
     st.rerun()
 
 
-def _ensure_flow(app, scopes):
+def _ensure_flow(app: msal.ConfidentialClientApplication, scopes: list[str]) -> dict:
     """
-    Create or restore MSAL auth flow.
-    Persist flow to query params so it survives Streamlit Cloud session loss.
+    Ensure we have an MSAL flow. Store it in URL query param so it survives
+    Streamlit Cloud new-session behavior.
     """
     cfg = _require_cfg()
 
-    # Prefer session flow
+    # Prefer existing flow in session
     if "ms_flow" in st.session_state:
         return st.session_state["ms_flow"]
 
-    # Try restoring from query params
+    # Restore from URL if present
     qp = st.query_params
     flow_b64 = qp.get(_FLOW_QP_KEY, None)
     if flow_b64:
@@ -100,14 +106,14 @@ def _ensure_flow(app, scopes):
             st.session_state["ms_flow"] = flow
             return flow
         except Exception:
-            # If corrupted, just create a new flow
+            # If corrupted, ignore and create new
             pass
 
     # Create new flow
     flow = app.initiate_auth_code_flow(scopes=scopes, redirect_uri=cfg["redirect_uri"])
     st.session_state["ms_flow"] = flow
 
-    # Persist into URL
+    # Persist to URL
     try:
         st.query_params[_FLOW_QP_KEY] = _b64e(flow)
     except Exception:
@@ -116,11 +122,11 @@ def _ensure_flow(app, scopes):
     return flow
 
 
-ddef login_ui(scopes=None):
+def login_ui(scopes: list[str] | None = None) -> None:
     """
-    ONE button UI (no JS):
-      - If callback comes back with ?code=, redeem token
-      - Otherwise show a single Sign In link button
+    Minimal UI:
+      - If not logged in, show ONE "Sign In" link button
+      - If callback has ?code=, redeem and store token, then rerun
     """
     app = _msal_app()
 
@@ -134,7 +140,7 @@ ddef login_ui(scopes=None):
 
     qp = st.query_params
 
-    # CALLBACK
+    # Callback handler
     if qp.get("code"):
         flow = _ensure_flow(app, scopes)
         auth_response = {k: qp.get(k) for k in qp.keys()}
@@ -158,14 +164,13 @@ ddef login_ui(scopes=None):
             st.error("Login failed. Click Sign In again.")
             return
 
-    # START LOGIN (single button, no JS)
+    # Start login (ONE button)
     flow = _ensure_flow(app, scopes)
     auth_url = flow["auth_uri"]
     st.link_button("Sign In", auth_url)
 
 
-
-def get_access_token():
+def get_access_token() -> str | None:
     token = st.session_state.get("ms_token")
     if not token:
         return None
@@ -176,6 +181,7 @@ def get_access_token():
         token["expires_at"] = int(time.time()) + int(expires_in)
         expires_at = token["expires_at"]
 
+    # Refresh by forcing re-login if about to expire
     if int(expires_at) - int(time.time()) < 120:
         _reset_login_state(clear_url=True)
         st.rerun()
