@@ -1,59 +1,35 @@
 import io
-import os
 import re
-import tempfile
-import subprocess
 from datetime import date, datetime
 
 import pandas as pd
 import streamlit as st
 from docx import Document
 from docx.shared import Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.text.paragraph import Paragraph
 
-from ms_graph import login_ui, access_token
-from sp_folder_graph import (
-    resolve_root_folder_from_share_link,
-    ensure_folder,
-    list_children,
-    compute_next_incident_id,
-    ensure_incident_folder,
-    upload_file_to_folder,
-)
+import ms_graph
+import sp_folder_graph as spg
 
+# ---------------- CONFIG ----------------
 TEMPLATE_PATH = "Incident Report Template_blank (1).docx"
 
-# City -> site code mapping (adjust if needed)
 CITY_CODES = {
     "Davao City": "DVO",
     "Quezon City": "QZN",
 }
 
-# -------- PDF conversion (optional) --------
-def convert_docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
-    """
-    Requires LibreOffice 'soffice' on the server.
-    Streamlit Cloud usually does NOT have libreoffice by default.
-    If you need PDF there, we can switch to:
-      - docx-only export, or
-      - external conversion service, or
-      - host on your own Linux VM with libreoffice installed.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        docx_path = os.path.join(tmpdir, "report.docx")
-        with open(docx_path, "wb") as f:
-            f.write(docx_bytes)
+STANDARD_IMAGE_WIDTH_IN = 5.5
 
-        cmd = [
-            "soffice", "--headless", "--nologo", "--nofirststartwizard",
-            "--convert-to", "pdf", "--outdir", tmpdir, docx_path,
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+SHAREPOINT_SITE_URL = st.secrets.get("sharepoint", {}).get("site_url", "")
+INCIDENT_REPORTS_ROOT_PATH = st.secrets.get("sharepoint", {}).get(
+    "incident_reports_root_path",
+    "Ground Station Operations/Installations, Maintenance and Repair/Incident Reports",
+)
 
-        pdf_path = os.path.join(tmpdir, "report.pdf")
-        with open(pdf_path, "rb") as f:
-            return f.read()
-
-# -------- docx utilities --------
+# ---------------- DOCX HELPERS ----------------
 def _clear_table_rows_except_header(table, header_rows=1):
     while len(table.rows) > header_rows:
         tbl = table._tbl
@@ -64,128 +40,187 @@ def _set_2col_table_value(table, label, value):
     for row in table.rows:
         if row.cells[0].text.strip() == label.strip():
             row.cells[1].text = "" if value is None else str(value)
-            return True
-    return False
+            return
 
 def _set_paragraph_after_heading(doc, heading_text, new_text):
     for i, p in enumerate(doc.paragraphs):
         if p.text.strip() == heading_text.strip():
             if i + 1 < len(doc.paragraphs):
-                doc.paragraphs[i + 1].text = "" if new_text is None else str(new_text)
-                return True
-    return False
+                doc.paragraphs[i + 1].text = new_text or ""
+            return
 
-def _append_images_after_heading(doc, heading_text, uploaded_files, width_in=5.5):
-    if not uploaded_files:
-        return False
+def _insert_paragraph_after(paragraph):
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    return Paragraph(new_p, paragraph._parent)
+
+def _append_figures_after_heading(doc, heading_text, files, captions, figure_start, section_label):
+    if not files:
+        return figure_start
+
     for i, p in enumerate(doc.paragraphs):
         if p.text.strip() == heading_text.strip():
-            # Insert after the body paragraph that follows heading
-            insert_after = i + 1
-            if insert_after >= len(doc.paragraphs):
-                insert_after = len(doc.paragraphs) - 1
-            # Insert images as new paragraphs after that paragraph
-            anchor = doc.paragraphs[insert_after]
-            for f in uploaded_files:
-                img_bytes = f.getvalue() if hasattr(f, "getvalue") else f.read()
-                new_p = anchor.insert_paragraph_after()
-                run = new_p.add_run()
-                run.add_picture(io.BytesIO(img_bytes), width=Inches(width_in))
-                anchor = new_p
-            return True
-    return False
+            anchor = doc.paragraphs[i + 1] if i + 1 < len(doc.paragraphs) else p
+            fig_no = figure_start
 
-def _fill_sequence_table_from_df(table, seq_df: pd.DataFrame):
-    _clear_table_rows_except_header(table, header_rows=0)  # template's table has no header row
-    for _, r in seq_df.iterrows():
-        row_cells = table.add_row().cells
-        row_cells[0].text = str(r.get("Date", ""))
-        row_cells[1].text = str(r.get("Time", ""))
-        row_cells[2].text = str(r.get("Category", ""))
-        row_cells[3].text = str(r.get("Message", ""))
+            for idx, f in enumerate(files):
+                # image
+                img_p = _insert_paragraph_after(anchor)
+                img_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = img_p.add_run()
+                run.add_picture(io.BytesIO(f.getvalue()), width=Inches(STANDARD_IMAGE_WIDTH_IN))
 
-def _fill_actions_table(table, actions_df: pd.DataFrame):
+                # caption
+                caption_text = ""
+                if captions and idx < len(captions):
+                    caption_text = (captions[idx] or "").strip()
+                if not caption_text:
+                    caption_text = f.name.rsplit(".", 1)[0]
+
+                cap_p = _insert_paragraph_after(img_p)
+                cap_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                cap_run = cap_p.add_run(f"Figure {fig_no}. {section_label} – {caption_text}")
+                cap_run.italic = True
+
+                anchor = cap_p
+                fig_no += 1
+
+            return fig_no
+
+    return figure_start
+
+def _fill_sequence_table(table, df):
+    _clear_table_rows_except_header(table, header_rows=0)
+    for _, r in df.iterrows():
+        cells = table.add_row().cells
+        cells[0].text = str(r.get("Date", ""))
+        cells[1].text = str(r.get("Time", ""))
+        cells[2].text = str(r.get("Category", ""))
+        cells[3].text = str(r.get("Message", ""))
+
+def _fill_actions_table(table, df):
     _clear_table_rows_except_header(table, header_rows=1)
-    for _, r in actions_df.iterrows():
-        row_cells = table.add_row().cells
-        row_cells[0].text = str(r.get("Date", ""))
-        row_cells[1].text = str(r.get("Time", ""))
-        row_cells[2].text = str(r.get("Performed by", ""))
-        row_cells[3].text = str(r.get("Action", ""))
-        row_cells[4].text = str(r.get("Result", ""))
+    for _, r in df.iterrows():
+        cells = table.add_row().cells
+        cells[0].text = str(r.get("Date", ""))
+        cells[1].text = str(r.get("Time", ""))
+        cells[2].text = str(r.get("Performed by", ""))
+        cells[3].text = str(r.get("Action", ""))
+        cells[4].text = str(r.get("Result", ""))
 
-def generate_docx_bytes(template_path, data):
-    doc = Document(template_path)
+def generate_docx(data):
+    doc = Document(TEMPLATE_PATH)
 
-    # Template tables (based on your uploaded template)
     t0, t1, t2, t3 = doc.tables[0], doc.tables[1], doc.tables[2], doc.tables[3]
 
-    # Table 0
     _set_2col_table_value(t0, "Reported by", data["reported_by"])
     _set_2col_table_value(t0, "Position", data["position"])
     _set_2col_table_value(t0, "Date of Report", data["date_of_report"])
-    _set_2col_table_value(t0, "Incident No.", data["incident_no"])
+    _set_2col_table_value(t0, "Incident No.", data["full_incident_no"])
 
-    # Table 1
     _set_2col_table_value(t1, "Date (YYYY-MM-DD)", data["incident_date"])
     _set_2col_table_value(t1, "Time", data["incident_time"])
     _set_2col_table_value(t1, "Location", data["location"])
     _set_2col_table_value(t1, "Current Status", data["current_status"])
 
-    # Paragraph sections
-    _set_paragraph_after_heading(doc, "Nature of Incident", data["nature_of_incident"])
-    _set_paragraph_after_heading(doc, "Damages Incurred (if any)", data["damages_incurred"])
+    _set_paragraph_after_heading(doc, "Nature of Incident", data["nature"])
+    _set_paragraph_after_heading(doc, "Damages Incurred (if any)", data["damages"])
     _set_paragraph_after_heading(doc, "Investigation and Analysis", data["investigation"])
     _set_paragraph_after_heading(doc, "Conclusion and Recommendations", data["conclusion"])
 
-    # Tables
-    _fill_sequence_table_from_df(t2, data["seq_df"])
+    _fill_sequence_table(t2, data["sequence_df"])
     _fill_actions_table(t3, data["actions_df"])
 
-    # Append images under headings
-    _append_images_after_heading(doc, "Sequence of Events", data["seq_images"])
-    _append_images_after_heading(doc, "Damages Incurred (if any)", data["damages_images"])
-    _append_images_after_heading(doc, "Investigation and Analysis", data["investigation_images"])
-    _append_images_after_heading(doc, "Conclusion and Recommendations", data["conclusion_images"])
+    fig = 1
+    fig = _append_figures_after_heading(doc, "Sequence of Events", data["sequence_images"], data["sequence_captions"], fig, "Sequence of Events")
+    fig = _append_figures_after_heading(doc, "Damages Incurred (if any)", data["damages_images"], data["damages_captions"], fig, "Damages Incurred")
+    fig = _append_figures_after_heading(doc, "Investigation and Analysis", data["investigation_images"], data["investigation_captions"], fig, "Investigation and Analysis")
+    fig = _append_figures_after_heading(doc, "Conclusion and Recommendations", data["conclusion_images"], data["conclusion_captions"], fig, "Conclusion and Recommendations")
 
     out = io.BytesIO()
     doc.save(out)
     out.seek(0)
     return out.read()
 
-# ---------------- Streamlit UI ----------------
+# ---------------- UI HELPERS ----------------
+def captions_editor(files, key):
+    if not files:
+        return []
+    df = pd.DataFrame({"File": [f.name for f in files], "Caption": ["" for _ in files]})
+    edited = st.data_editor(df, key=key, num_rows="fixed", use_container_width=True)
+    return edited["Caption"].tolist()
+
+def normalize_serial(serial_raw: str) -> str:
+    s = (serial_raw or "").strip()
+    if not s:
+        return ""
+    if not re.fullmatch(r"\d{1,4}", s):
+        return ""
+    return s.zfill(4)
+
+# ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="IR Generator", layout="wide")
 st.title("Incident Report Generator")
 
-login_ui()
-token = access_token()
+# Mode determines scopes
+mode = st.radio("Graph mode", ["Read-only (no upload)", "Write (create folders/upload)"], horizontal=True)
+scopes = ms_graph.DEFAULT_SCOPES_READONLY if mode.startswith("Read-only") else ms_graph.DEFAULT_SCOPES_WRITE
 
+# Login
+ms_graph.login_ui(scopes=scopes)
+token = ms_graph.get_access_token()
 if not token:
-    st.warning("Please login to Microsoft first (link above).")
     st.stop()
 
-cfg = st.secrets["ms_graph"]
-share_link = cfg["share_folder_link"]
+if not SHAREPOINT_SITE_URL:
+    st.error("Missing sharepoint.site_url in Streamlit secrets.")
+    st.stop()
 
-# Resolve root shared folder
-drive_id, root_id = resolve_root_folder_from_share_link(share_link, token)
+# Resolve site/drive once per session
+if "sp_site_id" not in st.session_state or "sp_drive_id" not in st.session_state:
+    with st.spinner("Resolving SharePoint site/drive..."):
+        st.session_state["sp_site_id"] = spg.resolve_site_id(token, SHAREPOINT_SITE_URL)
+        st.session_state["sp_drive_id"] = spg.get_default_drive_id(token, st.session_state["sp_site_id"])
 
-# Select year + city
-year = st.selectbox("Year", [datetime.now().year, datetime.now().year - 1, datetime.now().year + 1], index=0)
-city = st.selectbox("City folder", list(CITY_CODES.keys()), index=0)
+drive_id = st.session_state["sp_drive_id"]
+
+# Select year and city
+this_year = str(datetime.now().year)
+year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)])
+
+city = st.selectbox("City", list(CITY_CODES.keys()))
 site_code = CITY_CODES[city]
 
-# Ensure folders: Year -> City
-year_folder = ensure_folder(drive_id, root_id, str(year), token, create_if_missing=True)
-city_folder = ensure_folder(drive_id, year_folder["id"], city, token, create_if_missing=True)
+# Suggest next serial
+col1, col2 = st.columns([1, 2])
+with col1:
+    if st.button("Suggest next serial"):
+        try:
+            next_serial = spg.suggest_next_serial(token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, site_code)
+            st.session_state["serial_raw"] = next_serial
+            st.success(f"Suggested serial: {next_serial}")
+        except Exception as e:
+            st.error(str(e))
 
-# Compute next incident ID based on EXISTING INCIDENT FOLDERS in that city folder
-city_children = list_children(drive_id, city_folder["id"], token)
-incident_no = compute_next_incident_id(city_children, year, site_code)
+serial_raw = st.text_input("Incident serial (000#)", value=st.session_state.get("serial_raw", ""), placeholder="e.g. 0001 (or 1)")
+serial = normalize_serial(serial_raw)
 
-st.text_input("Incident No. (auto)", value=incident_no, disabled=True)
+full_incident_no = f"SMCOD-IR-GS-{site_code}-{year}-{serial}" if serial else ""
+st.text_input("Full Incident No. (auto)", value=full_incident_no, disabled=True)
 
-st.divider()
+with col2:
+    if st.button("Check duplicate"):
+        if not serial:
+            st.warning("Enter a valid serial first.")
+        else:
+            try:
+                dup = spg.check_duplicate_ir(token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, full_incident_no)
+                if dup:
+                    st.error("Duplicate found: IR folder already exists.")
+                else:
+                    st.success("No duplicate folder found.")
+            except Exception as e:
+                st.error(str(e))
 
 with st.form("ir_form"):
     c1, c2 = st.columns(2)
@@ -197,127 +232,130 @@ with st.form("ir_form"):
 
     with c2:
         incident_date = st.date_input("Incident Date", value=date.today()).strftime("%Y-%m-%d")
-        incident_time = st.text_input("Incident Time (HH:MM:SS)", value=datetime.now().strftime("%H:%M:%S"))
+        incident_time = st.text_input("Incident Time", value=datetime.now().strftime("%H:%M:%S"))
         location = st.text_input("Location", value=city)
-        current_status = st.selectbox("Current Status", ["Resolved", "Ongoing", "Monitoring", "Open"], index=0)
+        current_status = st.selectbox("Current Status", ["Resolved", "Ongoing", "Monitoring", "Open"])
 
-    st.subheader("Nature of Incident")
-    nature_of_incident = st.text_area("Nature of Incident", height=120)
+    nature = st.text_area("Nature of Incident", height=120)
 
-    st.subheader("Sequence of Events (table)")
-    seq_df_default = pd.DataFrame([{"Date": incident_date, "Time": "", "Category": "", "Message": ""}])
-    seq_df = st.data_editor(seq_df_default, num_rows="dynamic", use_container_width=True)
-
-    seq_images = st.file_uploader(
-        "Sequence of Events Photos (optional, appended under Sequence of Events)",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
+    st.subheader("Sequence of Events")
+    seq_df = st.data_editor(
+        pd.DataFrame([{"Date": incident_date, "Time": "", "Category": "", "Message": ""}]),
+        num_rows="dynamic",
+        use_container_width=True,
     )
+    seq_imgs = st.file_uploader("Sequence Photos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    seq_caps = captions_editor(seq_imgs or [], "seq_caps")
 
-    st.subheader("Damages / Investigation / Conclusion")
-    damages_incurred = st.text_area("Damages Incurred (if any)", height=80, value="None")
-    damages_images = st.file_uploader("Damages Photos (optional)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    damages = st.text_area("Damages Incurred", value="None")
+    dmg_imgs = st.file_uploader("Damage Photos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    dmg_caps = captions_editor(dmg_imgs or [], "dmg_caps")
 
     investigation = st.text_area("Investigation and Analysis", height=120)
-    investigation_images = st.file_uploader("Investigation Photos (optional)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    inv_imgs = st.file_uploader("Investigation Photos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    inv_caps = captions_editor(inv_imgs or [], "inv_caps")
 
     conclusion = st.text_area("Conclusion and Recommendations", height=120)
-    conclusion_images = st.file_uploader("Conclusion/Recommendations Photos (optional)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    con_imgs = st.file_uploader("Conclusion Photos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    con_caps = captions_editor(con_imgs or [], "con_caps")
 
-    st.subheader("Response and Actions Taken (table)")
-    actions_default = pd.DataFrame([{"Date": incident_date, "Time": "", "Performed by": "", "Action": "", "Result": ""}])
-    actions_df = st.data_editor(actions_default, num_rows="dynamic", use_container_width=True)
+    st.subheader("Response and Actions Taken")
+    actions_df = st.data_editor(
+        pd.DataFrame([{"Date": incident_date, "Time": "", "Performed by": "", "Action": "", "Result": ""}]),
+        num_rows="dynamic",
+        use_container_width=True,
+    )
 
-    export_pdf = st.checkbox("Also export PDF (requires LibreOffice on host)", value=False)
+    do_upload = st.checkbox("Create IR folder and upload DOCX + images (requires Write consent)")
+    submit = st.form_submit_button("Generate Report")
 
-    submitted = st.form_submit_button("Generate and Upload")
-
-if submitted:
-    if not os.path.exists(TEMPLATE_PATH):
-        st.error(f"Template not found in repo root: {TEMPLATE_PATH}")
+if submit:
+    if not serial:
+        st.error("Enter a valid incident serial (numbers only up to 4 digits). Example: 0001 or 1.")
         st.stop()
 
-    # Create incident folder first (prevents duplicates by failing if it exists)
+    # Block duplicates (best-effort)
     try:
-        incident_folder = ensure_incident_folder(drive_id, city_folder["id"], incident_no, token)
+        if spg.check_duplicate_ir(token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, full_incident_no):
+            st.error("Duplicate found: IR folder already exists. Choose a new serial.")
+            st.stop()
     except Exception as e:
-        st.error(f"Could not create incident folder (maybe already exists): {e}")
-        st.stop()
-
-    incident_folder_id = incident_folder["id"]
+        st.warning(f"Duplicate check failed (continuing): {e}")
 
     data = {
         "reported_by": reported_by,
         "position": position,
         "date_of_report": date_of_report,
-        "incident_no": incident_no,
+        "full_incident_no": full_incident_no,
         "incident_date": incident_date,
         "incident_time": incident_time,
         "location": location,
         "current_status": current_status,
-        "nature_of_incident": nature_of_incident,
-        "seq_df": seq_df,
-        "actions_df": actions_df,
-        "damages_incurred": damages_incurred,
+        "nature": nature,
+        "damages": damages,
         "investigation": investigation,
         "conclusion": conclusion,
-        "seq_images": seq_images or [],
-        "damages_images": damages_images or [],
-        "investigation_images": investigation_images or [],
-        "conclusion_images": conclusion_images or [],
+        "sequence_df": seq_df,
+        "actions_df": actions_df,
+        "sequence_images": seq_imgs or [],
+        "damages_images": dmg_imgs or [],
+        "investigation_images": inv_imgs or [],
+        "conclusion_images": con_imgs or [],
+        "sequence_captions": seq_caps or [],
+        "damages_captions": dmg_caps or [],
+        "investigation_captions": inv_caps or [],
+        "conclusion_captions": con_caps or [],
     }
 
-    docx_bytes = generate_docx_bytes(TEMPLATE_PATH, data)
+    docx_bytes = generate_docx(data)
 
-    # Upload DOCX
-    upload_file_to_folder(drive_id, incident_folder_id, f"{incident_no}.docx", docx_bytes, token)
-
-    # Upload images as separate files too (optional but useful for records)
-    def upload_images(prefix, files):
-        for idx, f in enumerate(files, start=1):
-            ext = "jpg"
-            name_lower = f.name.lower()
-            if name_lower.endswith(".png"):
-                ext = "png"
-            elif name_lower.endswith(".jpeg"):
-                ext = "jpeg"
-            elif name_lower.endswith(".jpg"):
-                ext = "jpg"
-            else:
-                # default if unknown
-                ext = name_lower.split(".")[-1] if "." in name_lower else "jpg"
-
-            fname = f"{prefix}_{idx:02d}.{ext}"
-            upload_file_to_folder(drive_id, incident_folder_id, fname, f.getvalue(), token)
-
-    upload_images("sequence", seq_images or [])
-    upload_images("damages", damages_images or [])
-    upload_images("investigation", investigation_images or [])
-    upload_images("conclusion", conclusion_images or [])
-
-    # Optional PDF (may fail on Streamlit Cloud)
-    pdf_bytes = None
-    if export_pdf:
-        try:
-            pdf_bytes = convert_docx_to_pdf_bytes(docx_bytes)
-            upload_file_to_folder(drive_id, incident_folder_id, f"{incident_no}.pdf", pdf_bytes, token)
-        except Exception as e:
-            st.warning(f"PDF conversion failed on this host: {e}")
-
-    st.success(f"Done. Uploaded to {year}/{city}/{incident_no}/")
-
-    # Provide downloads too
+    st.success("Incident Report generated.")
     st.download_button(
-        "Download DOCX",
+        "Download Incident Report (DOCX)",
         data=docx_bytes,
-        file_name=f"{incident_no}.docx",
+        file_name=f"{full_incident_no}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
-    if pdf_bytes:
-        st.download_button(
-            "Download PDF",
-            data=pdf_bytes,
-            file_name=f"{incident_no}.pdf",
-            mime="application/pdf",
-        )
+    if do_upload:
+        try:
+            # Ensure folders exist: {year}/{city}/{IR_FOLDER}
+            final_folder = spg.ensure_path(
+                token,
+                drive_id,
+                INCIDENT_REPORTS_ROOT_PATH,
+                parts=[year, city, full_incident_no],
+            )
+
+            # Upload DOCX
+            spg.upload_file_to_folder(
+                token,
+                drive_id,
+                final_folder["id"],
+                filename=f"{full_incident_no}.docx",
+                content_bytes=docx_bytes,
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+            # Upload images (optional naming)
+            def upload_images(prefix, files):
+                for idx, f in enumerate(files or [], start=1):
+                    ext = (f.name.rsplit(".", 1)[-1] or "jpg").lower()
+                    mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
+                    spg.upload_file_to_folder(
+                        token,
+                        drive_id,
+                        final_folder["id"],
+                        filename=f"{prefix}_{idx:02d}.{ext}",
+                        content_bytes=f.getvalue(),
+                        content_type=mime,
+                    )
+
+            upload_images("sequence", seq_imgs)
+            upload_images("damages", dmg_imgs)
+            upload_images("investigation", inv_imgs)
+            upload_images("conclusion", con_imgs)
+
+            st.success("Uploaded to SharePoint successfully.")
+        except Exception as e:
+            st.error(f"Upload failed: {e}")

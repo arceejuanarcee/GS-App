@@ -1,117 +1,127 @@
-import base64
 import re
 import requests
 
-GRAPH = "https://graph.microsoft.com/v1.0"
+GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 
-def share_link_to_share_id(url: str) -> str:
-    b = base64.urlsafe_b64encode(url.encode("utf-8")).decode("utf-8").rstrip("=")
-    return "u!" + b
+def _headers(access_token: str):
+    return {"Authorization": f"Bearer {access_token}"}
 
-def _headers(token: str):
-    return {"Authorization": f"Bearer {token}"}
-
-def graph_get(url: str, token: str, params=None):
-    r = requests.get(url, headers=_headers(token), params=params, timeout=30)
-    r.raise_for_status()
+def graph_get(access_token: str, url: str, params=None):
+    r = requests.get(url, headers=_headers(access_token), params=params, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"GET {url} failed: {r.status_code} {r.text}")
     return r.json()
 
-def graph_post(url: str, token: str, body: dict):
+def graph_post(access_token: str, url: str, json_body=None):
     r = requests.post(
         url,
-        headers={**_headers(token), "Content-Type": "application/json"},
-        json=body,
-        timeout=30,
+        headers={**_headers(access_token), "Content-Type": "application/json"},
+        json=json_body,
+        timeout=60,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"POST {url} failed: {r.status_code} {r.text}")
     return r.json()
 
-def graph_put(url: str, token: str, data: bytes, content_type: str):
+def graph_put_bytes(access_token: str, url: str, content_bytes: bytes, content_type="application/octet-stream"):
     r = requests.put(
         url,
-        headers={**_headers(token), "Content-Type": content_type},
-        data=data,
+        headers={**_headers(access_token), "Content-Type": content_type},
+        data=content_bytes,
         timeout=120,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(f"PUT {url} failed: {r.status_code} {r.text}")
     return r.json()
 
-def resolve_root_folder_from_share_link(share_link: str, token: str) -> tuple[str, str]:
+# ---------------- SharePoint Resolution ----------------
+
+def resolve_site_id(access_token: str, sharepoint_site_url: str) -> str:
     """
-    Returns (drive_id, root_item_id) for the shared folder link.
+    sharepoint_site_url example:
+      https://philsagov.sharepoint.com/sites/SMCOD
+      https://philsagov.sharepoint.com/teams/SMCOD
     """
-    share_id = share_link_to_share_id(share_link)
-    item = graph_get(f"{GRAPH}/shares/{share_id}/driveItem", token)
-    root_item_id = item["id"]
-    drive_id = item["parentReference"]["driveId"]
-    return drive_id, root_item_id
+    m = re.match(r"^https://([^/]+)(/.*)$", sharepoint_site_url.strip())
+    if not m:
+        raise ValueError("Invalid SharePoint site URL.")
+    host = m.group(1)
+    path = m.group(2).rstrip("/")
+    url = f"{GRAPH_ROOT}/sites/{host}:{path}"
+    data = graph_get(access_token, url)
+    return data["id"]
 
-def list_children(drive_id: str, item_id: str, token: str) -> list[dict]:
-    data = graph_get(f"{GRAPH}/drives/{drive_id}/items/{item_id}/children", token)
-    return data.get("value", [])
+def get_default_drive_id(access_token: str, site_id: str) -> str:
+    data = graph_get(access_token, f"{GRAPH_ROOT}/sites/{site_id}/drive")
+    return data["id"]
 
-def find_child_folder(children: list[dict], folder_name: str) -> dict | None:
-    for it in children:
-        if it.get("name") == folder_name and "folder" in it:
-            return it
-    return None
-
-def create_folder(drive_id: str, parent_item_id: str, folder_name: str, token: str) -> dict:
-    url = f"{GRAPH}/drives/{drive_id}/items/{parent_item_id}/children"
-    body = {
-        "name": folder_name,
-        "folder": {},
-        "@microsoft.graph.conflictBehavior": "fail",
-    }
-    return graph_post(url, token, body)
-
-def ensure_folder(drive_id: str, parent_item_id: str, folder_name: str, token: str, create_if_missing=True) -> dict:
-    children = list_children(drive_id, parent_item_id, token)
-    found = find_child_folder(children, folder_name)
-    if found:
-        return found
-    if not create_if_missing:
-        raise FileNotFoundError(f"Folder not found: {folder_name}")
-    return create_folder(drive_id, parent_item_id, folder_name, token)
-
-def compute_next_incident_id(children: list[dict], year: int, site_code: str) -> str:
+def get_item_by_path(access_token: str, drive_id: str, path: str) -> dict:
     """
-    children here are items under the CITY folder. Incidents are folders named:
-    SMCOD-IR-GS-DVO-2025-0001
+    Gets a DriveItem by path relative to drive root.
     """
-    pat = re.compile(rf"^SMCOD-IR-GS-{re.escape(site_code)}-{year}-(\d{{4}})$", re.IGNORECASE)
-    nums = []
-    for it in children:
-        if "folder" not in it:
-            continue
-        name = it.get("name", "")
-        m = pat.match(name)
+    path = path.strip("/")
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/root:/{path}"
+    return graph_get(access_token, url)
+
+def list_children(access_token: str, drive_id: str, item_id: str) -> list[dict]:
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/children"
+    items = []
+    next_url = url
+    while next_url:
+        data = graph_get(access_token, next_url)
+        items.extend(data.get("value", []))
+        next_url = data.get("@odata.nextLink")
+    return items
+
+# ---------------- IR folder logic ----------------
+
+def list_city_folders(access_token: str, drive_id: str, incident_reports_root_path: str, year: str) -> list[str]:
+    year_item = get_item_by_path(access_token, drive_id, f"{incident_reports_root_path}/{year}")
+    children = list_children(access_token, drive_id, year_item["id"])
+    return sorted([c["name"] for c in children if "folder" in c])
+
+def list_ir_folders_in_city(access_token: str, drive_id: str, incident_reports_root_path: str, year: str, city_folder: str) -> list[str]:
+    city_item = get_item_by_path(access_token, drive_id, f"{incident_reports_root_path}/{year}/{city_folder}")
+    children = list_children(access_token, drive_id, city_item["id"])
+    return sorted([c["name"] for c in children if "folder" in c])
+
+def parse_last_serial(ir_folder_names: list[str], site_code: str, year: str) -> int:
+    pat = re.compile(rf"^SMCOD-IR-GS-{re.escape(site_code)}-{re.escape(str(year))}-(\d{{4}})$")
+    max_n = 0
+    for name in ir_folder_names:
+        m = pat.match(name.strip())
         if m:
-            nums.append(int(m.group(1)))
-    nxt = (max(nums) + 1) if nums else 1
-    return f"SMCOD-IR-GS-{site_code}-{year}-{nxt:04d}"
+            max_n = max(max_n, int(m.group(1)))
+    return max_n
 
-def ensure_incident_folder(drive_id: str, city_folder_id: str, incident_id: str, token: str) -> dict:
-    """
-    Creates incident folder under the CITY folder. If exists, raises to prevent overwrite.
-    """
-    return create_folder(drive_id, city_folder_id, incident_id, token)
+def suggest_next_serial(access_token: str, drive_id: str, incident_reports_root_path: str, year: str, city_folder: str, site_code: str) -> str:
+    folders = list_ir_folders_in_city(access_token, drive_id, incident_reports_root_path, year, city_folder)
+    last_n = parse_last_serial(folders, site_code, year)
+    return f"{last_n + 1:04d}"
 
-def upload_file_to_folder(drive_id: str, folder_item_id: str, filename: str, file_bytes: bytes, token: str) -> dict:
-    """
-    Upload into folder using simple PUT. Good for small/medium files.
-    If you expect huge PDFs/images, ask me for upload-session chunking.
-    """
-    if filename.lower().endswith(".docx"):
-        ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    elif filename.lower().endswith(".pdf"):
-        ctype = "application/pdf"
-    elif filename.lower().endswith((".jpg", ".jpeg")):
-        ctype = "image/jpeg"
-    elif filename.lower().endswith(".png"):
-        ctype = "image/png"
-    else:
-        ctype = "application/octet-stream"
+def check_duplicate_ir(access_token: str, drive_id: str, incident_reports_root_path: str, year: str, city_folder: str, full_ir_no: str) -> bool:
+    folders = list_ir_folders_in_city(access_token, drive_id, incident_reports_root_path, year, city_folder)
+    return full_ir_no in set(folders)
 
-    url = f"{GRAPH}/drives/{drive_id}/items/{folder_item_id}:/{filename}:/content"
-    return graph_put(url, token, file_bytes, ctype)
+# ---------------- Write ops (requires Sites.ReadWrite.All) ----------------
+
+def ensure_folder(access_token: str, drive_id: str, parent_item_id: str, folder_name: str) -> dict:
+    children = list_children(access_token, drive_id, parent_item_id)
+    for c in children:
+        if c.get("name") == folder_name and "folder" in c:
+            return c
+
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{parent_item_id}/children"
+    body = {"name": folder_name, "folder": {}, "@microsoft.graph.conflictBehavior": "fail"}
+    return graph_post(access_token, url, body)
+
+def ensure_path(access_token: str, drive_id: str, root_path: str, parts: list[str]) -> dict:
+    root_item = get_item_by_path(access_token, drive_id, root_path)
+    cur = root_item
+    for p in parts:
+        cur = ensure_folder(access_token, drive_id, cur["id"], p)
+    return cur
+
+def upload_file_to_folder(access_token: str, drive_id: str, folder_item_id: str, filename: str, content_bytes: bytes, content_type: str):
+    url = f"{GRAPH_ROOT}/drives/{drive_id}/items/{folder_item_id}:/{filename}:/content"
+    return graph_put_bytes(access_token, url, content_bytes, content_type=content_type)

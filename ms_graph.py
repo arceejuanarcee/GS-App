@@ -3,7 +3,7 @@ import time
 import streamlit as st
 import msal
 
-# IMPORTANT: Do NOT include "openid", "profile", "offline_access" in SCOPES for MSAL python
+# IMPORTANT: Do NOT include "openid", "profile", "offline_access" in scopes for MSAL Python.
 DEFAULT_SCOPES_READONLY = ["User.Read", "Sites.Read.All"]
 DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]
 
@@ -34,7 +34,6 @@ def _msal_app():
 def _reset_login_state():
     for k in ["ms_flow", "ms_token", "ms_scopes"]:
         st.session_state.pop(k, None)
-    # also clear URL params so we don't re-trigger the same bad callback
     try:
         st.query_params.clear()
     except Exception:
@@ -47,45 +46,42 @@ def logout_button():
 
 def login_ui(scopes=None):
     """
-    Safe Streamlit/MSAL auth-code flow:
-    - Handles callback once
-    - Avoids re-creating flow each rerun
-    - If state mismatch happens, resets and asks user to try again
+    Streamlit/MSAL auth code flow:
+    - Avoids regenerating auth flow each rerun
+    - Handles callback
+    - Recovers from state mismatch cleanly
     """
     cfg = _cfg()
     app = _msal_app()
 
     if scopes is None:
         scopes = DEFAULT_SCOPES_READONLY
+
     st.session_state["ms_scopes"] = scopes
 
-    # Already logged in
     if st.session_state.get("ms_token"):
         st.success("Logged in to Microsoft.")
         logout_button()
         return
 
-    # --- CALLBACK HANDLER ---
-    qp = st.query_params  # streamlit >=1.30
+    qp = st.query_params
+
+    # Callback
     if "code" in qp:
         flow = st.session_state.get("ms_flow")
         if not flow:
-            # Flow missing usually means rerun/new session; restart cleanly
             st.warning("Login session expired. Please sign in again.")
             _reset_login_state()
             st.stop()
 
         try:
-            # Convert query params to normal dict[str,str]
             auth_response = {k: qp.get(k) for k in qp.keys()}
             result = app.acquire_token_by_auth_code_flow(flow, auth_response)
-
         except ValueError as e:
-            # This catches "state mismatch" and similar flow issues
             if "state mismatch" in str(e).lower():
                 st.warning(
                     "Login was interrupted (state mismatch). "
-                    "Please click Sign in again and avoid opening multiple tabs."
+                    "Please sign in again and avoid multiple tabs/refresh during login."
                 )
                 _reset_login_state()
                 st.stop()
@@ -93,7 +89,6 @@ def login_ui(scopes=None):
 
         if "access_token" in result:
             st.session_state["ms_token"] = result
-            # clear query params after successful login
             st.query_params.clear()
             st.success("Login successful.")
             st.rerun()
@@ -102,7 +97,7 @@ def login_ui(scopes=None):
             _reset_login_state()
             st.stop()
 
-    # --- START LOGIN (ONLY CREATE FLOW ONCE) ---
+    # Start login (create flow only once)
     if "ms_flow" not in st.session_state:
         st.session_state["ms_flow"] = app.initiate_auth_code_flow(
             scopes=scopes,
@@ -112,16 +107,12 @@ def login_ui(scopes=None):
     auth_url = st.session_state["ms_flow"].get("auth_uri")
 
     st.markdown("### Microsoft Sign-in required")
-    st.markdown(
-        "To avoid errors: **click the sign-in link once**, and do not open it in multiple tabs."
-    )
+    st.markdown("Tip: click sign-in **once** and avoid refreshing during login.")
 
-    # Use a button to prevent accidental multi-click reruns
     if st.button("Sign in with Microsoft"):
         st.markdown(f"[Continue to Microsoft sign-in]({auth_url})")
 
-    # Show link as fallback
-    st.caption("If the button does not open, use the link below:")
+    st.caption("Fallback link:")
     st.markdown(f"[Microsoft Sign-in Link]({auth_url})")
 
 def get_access_token():
