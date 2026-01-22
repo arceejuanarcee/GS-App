@@ -3,7 +3,6 @@ import time
 import streamlit as st
 import msal
 
-# IMPORTANT: Do NOT include "openid", "profile", "offline_access" in scopes for MSAL Python.
 DEFAULT_SCOPES_READONLY = ["User.Read", "Sites.Read.All"]
 DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]
 
@@ -31,34 +30,46 @@ def _msal_app():
         authority=cfg["authority"],
     )
 
-def _reset_login_state():
+def _reset_login_state(clear_url=True):
     for k in ["ms_flow", "ms_token", "ms_scopes"]:
         st.session_state.pop(k, None)
-    try:
-        st.query_params.clear()
-    except Exception:
-        pass
+    if clear_url:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
 
 def logout_button():
     if st.button("Log out"):
         _reset_login_state()
         st.rerun()
 
-def login_ui(scopes=None):
+def _ensure_flow(app, scopes):
     """
-    Streamlit/MSAL auth code flow:
-    - Avoids regenerating auth flow each rerun
-    - Handles callback
-    - Recovers from state mismatch cleanly
+    Ensure we have a flow stored in session_state.
     """
     cfg = _cfg()
+    if "ms_flow" not in st.session_state:
+        st.session_state["ms_flow"] = app.initiate_auth_code_flow(
+            scopes=scopes,
+            redirect_uri=cfg["redirect_uri"],
+        )
+    return st.session_state["ms_flow"]
+
+def login_ui(scopes=None):
+    """
+    Streamlit Cloud friendly auth flow.
+    Key behavior:
+      - Always shows a single auth link (user should use same tab)
+      - If callback arrives but flow missing, it restarts flow automatically
+    """
     app = _msal_app()
 
     if scopes is None:
         scopes = DEFAULT_SCOPES_READONLY
-
     st.session_state["ms_scopes"] = scopes
 
+    # Already logged in
     if st.session_state.get("ms_token"):
         st.success("Logged in to Microsoft.")
         logout_button()
@@ -66,54 +77,56 @@ def login_ui(scopes=None):
 
     qp = st.query_params
 
-    # Callback
+    # --- CALLBACK ---
     if "code" in qp:
+        # If flow missing, recreate flow and ask user to sign in again.
+        # We cannot safely redeem an auth code without the original flow state.
         flow = st.session_state.get("ms_flow")
         if not flow:
-            st.warning("Login session expired. Please sign in again.")
-            _reset_login_state()
+            st.warning(
+                "Login callback received but session state was lost (Streamlit Cloud behavior). "
+                "Please click the sign-in link again (same tab)."
+            )
+            # Clear the old callback params, restart flow
+            _reset_login_state(clear_url=True)
+            flow = _ensure_flow(app, scopes)
+            st.markdown(f"[Sign in with Microsoft]({flow['auth_uri']})")
             st.stop()
 
         try:
             auth_response = {k: qp.get(k) for k in qp.keys()}
             result = app.acquire_token_by_auth_code_flow(flow, auth_response)
         except ValueError as e:
-            if "state mismatch" in str(e).lower():
-                st.warning(
-                    "Login was interrupted (state mismatch). "
-                    "Please sign in again and avoid multiple tabs/refresh during login."
-                )
-                _reset_login_state()
-                st.stop()
-            raise
+            # state mismatch or other flow errors
+            st.warning(
+                f"Login interrupted ({str(e)}). Please sign in again and avoid multiple tabs/refresh."
+            )
+            _reset_login_state(clear_url=True)
+            flow = _ensure_flow(app, scopes)
+            st.markdown(f"[Sign in with Microsoft]({flow['auth_uri']})")
+            st.stop()
 
         if "access_token" in result:
             st.session_state["ms_token"] = result
-            st.query_params.clear()
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
             st.success("Login successful.")
             st.rerun()
         else:
             st.error(f"Login failed: {result.get('error')} - {result.get('error_description')}")
-            _reset_login_state()
+            _reset_login_state(clear_url=True)
+            flow = _ensure_flow(app, scopes)
+            st.markdown(f"[Sign in with Microsoft]({flow['auth_uri']})")
             st.stop()
 
-    # Start login (create flow only once)
-    if "ms_flow" not in st.session_state:
-        st.session_state["ms_flow"] = app.initiate_auth_code_flow(
-            scopes=scopes,
-            redirect_uri=cfg["redirect_uri"],
-        )
-
-    auth_url = st.session_state["ms_flow"].get("auth_uri")
+    # --- START LOGIN ---
+    flow = _ensure_flow(app, scopes)
 
     st.markdown("### Microsoft Sign-in required")
-    st.markdown("Tip: click sign-in **once** and avoid refreshing during login.")
-
-    if st.button("Sign in with Microsoft"):
-        st.markdown(f"[Continue to Microsoft sign-in]({auth_url})")
-
-    st.caption("Fallback link:")
-    st.markdown(f"[Microsoft Sign-in Link]({auth_url})")
+    st.caption("Important: Use the sign-in link in the SAME tab. Avoid refresh while signing in.")
+    st.markdown(f"[Sign in with Microsoft]({flow['auth_uri']})")
 
 def get_access_token():
     token = st.session_state.get("ms_token")
