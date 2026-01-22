@@ -1,11 +1,16 @@
 import os
 import time
+import json
+import base64
 import streamlit as st
 import msal
 import streamlit.components.v1 as components
 
 DEFAULT_SCOPES_READONLY = ["User.Read", "Sites.Read.All"]
 DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]
+
+_FLOW_QP_KEY = "ms_flow_b64"
+
 
 def _cfg():
     s = st.secrets.get("ms_graph", {})
@@ -16,8 +21,8 @@ def _cfg():
         "tenant_id": tenant_id,
         "redirect_uri": s.get("redirect_uri") or os.getenv("MS_REDIRECT_URI", ""),
         "authority": s.get("authority") or f"https://login.microsoftonline.com/{tenant_id}",
-        "debug": bool(s.get("debug", False)),
     }
+
 
 def _msal_app():
     cfg = _cfg()
@@ -32,8 +37,19 @@ def _msal_app():
         authority=cfg["authority"],
     )
 
+
+def _b64e(obj: dict) -> str:
+    raw = json.dumps(obj).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8")
+
+
+def _b64d(s: str) -> dict:
+    raw = base64.urlsafe_b64decode(s.encode("utf-8"))
+    return json.loads(raw.decode("utf-8"))
+
+
 def _reset_login_state(clear_url=True):
-    for k in ["ms_flow", "ms_token", "ms_scopes", "ms_auth_clicked"]:
+    for k in ["ms_flow", "ms_token", "ms_scopes"]:
         st.session_state.pop(k, None)
     if clear_url:
         try:
@@ -41,28 +57,55 @@ def _reset_login_state(clear_url=True):
         except Exception:
             pass
 
+
 def logout_button():
     if st.button("Log out"):
         _reset_login_state()
         st.rerun()
 
+
 def _ensure_flow(app, scopes):
+    """
+    Create a flow and persist it BOTH in session_state and in query params.
+    This survives Streamlit Cloud session loss after MS redirects back.
+    """
     cfg = _cfg()
-    if "ms_flow" not in st.session_state:
-        st.session_state["ms_flow"] = app.initiate_auth_code_flow(
-            scopes=scopes,
-            redirect_uri=cfg["redirect_uri"],
-        )
-    return st.session_state["ms_flow"]
+
+    # If flow already exists in session, use it
+    if "ms_flow" in st.session_state:
+        return st.session_state["ms_flow"]
+
+    # If flow is in query params, restore it
+    qp = st.query_params
+    if _FLOW_QP_KEY in qp:
+        try:
+            flow = _b64d(qp.get(_FLOW_QP_KEY))
+            st.session_state["ms_flow"] = flow
+            return flow
+        except Exception:
+            # If it's corrupted, ignore and create new flow
+            pass
+
+    # Otherwise create new flow
+    flow = app.initiate_auth_code_flow(scopes=scopes, redirect_uri=cfg["redirect_uri"])
+    st.session_state["ms_flow"] = flow
+
+    # Persist flow into URL so it survives a new session
+    try:
+        st.query_params[_FLOW_QP_KEY] = _b64e(flow)
+    except Exception:
+        pass
+
+    return flow
+
 
 def login_ui(scopes=None):
     """
-    Minimal UI:
-      - Shows only "Sign In"
-      - First tries same-tab redirect via JS
-      - If JS is blocked, shows a single link_button also labeled "Sign In"
+    ONE button only: Sign In
+    - If already logged in: returns
+    - If callback (?code=...): redeems token and reruns
+    - Otherwise: shows Sign In button and redirects same tab
     """
-    cfg = _cfg()
     app = _msal_app()
 
     if scopes is None:
@@ -71,34 +114,27 @@ def login_ui(scopes=None):
 
     # Already logged in
     if st.session_state.get("ms_token"):
-        st.success("Logged in.")
-        logout_button()
+        # (Optional) keep it minimal
         return
 
     qp = st.query_params
 
-    # Optional debug (goes to app log, not UI)
-    if cfg["debug"]:
-        # Safe debug: show only qp keys
-        st.write({"debug_query_param_keys": list(qp.keys())})
-
-    # CALLBACK: redeem code
+    # CALLBACK: if we have a code, redeem it
     if "code" in qp:
-        flow = st.session_state.get("ms_flow")
-        if not flow:
-            # Can't redeem without original flow; restart cleanly
-            _reset_login_state(clear_url=True)
-            st.rerun()
-
+        flow = _ensure_flow(app, scopes)  # restore flow even if session was lost
         auth_response = {k: qp.get(k) for k in qp.keys()}
+
         try:
             result = app.acquire_token_by_auth_code_flow(flow, auth_response)
         except ValueError:
+            # State mismatch, stale flow, etc.
             _reset_login_state(clear_url=True)
-            st.rerun()
+            st.error("Login failed. Please click Sign In again.")
+            return
 
         if "access_token" in result:
             st.session_state["ms_token"] = result
+            # Clear URL params after success
             try:
                 st.query_params.clear()
             except Exception:
@@ -106,30 +142,25 @@ def login_ui(scopes=None):
             st.rerun()
         else:
             _reset_login_state(clear_url=True)
-            st.rerun()
+            st.error("Login failed. Please click Sign In again.")
+            return
 
-    # START LOGIN
+    # START LOGIN (no callback yet)
     flow = _ensure_flow(app, scopes)
     auth_url = flow["auth_uri"]
 
-    clicked = st.button("Sign In")
-    if clicked:
-        st.session_state["ms_auth_clicked"] = True
-        # same-tab redirect attempt
+    # ONE button only
+    if st.button("Sign In"):
+        # Same-tab redirect
         components.html(
             f"""
             <script>
-              try {{
-                window.top.location.href = "{auth_url}";
-              }} catch (e) {{}}
+              window.top.location.href = "{auth_url}";
             </script>
             """,
             height=0,
         )
 
-    # Show link fallback ONLY after click (so it doesn't appear immediately)
-    if st.session_state.get("ms_auth_clicked"):
-        st.link_button("Sign In", auth_url)
 
 def get_access_token():
     token = st.session_state.get("ms_token")
@@ -142,6 +173,7 @@ def get_access_token():
         token["expires_at"] = int(time.time()) + int(expires_in)
         expires_at = token["expires_at"]
 
+    # expire soon => force relogin
     if int(expires_at) - int(time.time()) < 120:
         _reset_login_state()
         st.rerun()
