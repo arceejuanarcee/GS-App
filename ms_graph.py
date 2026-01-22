@@ -116,11 +116,11 @@ def _ensure_flow(app, scopes):
     return flow
 
 
-def login_ui(scopes=None):
+ddef login_ui(scopes=None):
     """
-    ONE button UI:
+    ONE button UI (no JS):
       - If callback comes back with ?code=, redeem token
-      - Otherwise show Sign In button and same-tab redirect
+      - Otherwise show a single Sign In link button
     """
     app = _msal_app()
 
@@ -134,7 +134,7 @@ def login_ui(scopes=None):
 
     qp = st.query_params
 
-    # If callback
+    # CALLBACK
     if qp.get("code"):
         flow = _ensure_flow(app, scopes)
         auth_response = {k: qp.get(k) for k in qp.keys()}
@@ -158,19 +158,11 @@ def login_ui(scopes=None):
             st.error("Login failed. Click Sign In again.")
             return
 
-    # Start login
+    # START LOGIN (single button, no JS)
     flow = _ensure_flow(app, scopes)
     auth_url = flow["auth_uri"]
+    st.link_button("Sign In", auth_url)
 
-    if st.button("Sign In"):
-        components.html(
-            f"""
-            <script>
-              window.top.location.href = "{auth_url}";
-            </script>
-            """,
-            height=0,
-        )
 
 
 def get_access_token():
