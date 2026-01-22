@@ -2,9 +2,11 @@ import os
 import time
 import streamlit as st
 import msal
+import streamlit.components.v1 as components
 
 DEFAULT_SCOPES_READONLY = ["User.Read", "Sites.Read.All"]
 DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]
+
 
 def _cfg():
     s = st.secrets.get("ms_graph", {})
@@ -16,6 +18,7 @@ def _cfg():
         "redirect_uri": s.get("redirect_uri") or os.getenv("MS_REDIRECT_URI", ""),
         "authority": s.get("authority") or f"https://login.microsoftonline.com/{tenant_id}",
     }
+
 
 def _msal_app():
     cfg = _cfg()
@@ -30,8 +33,9 @@ def _msal_app():
         authority=cfg["authority"],
     )
 
+
 def _reset_login_state(clear_url=True):
-    for k in ["ms_flow", "ms_token", "ms_scopes"]:
+    for k in ["ms_flow", "ms_token", "ms_scopes", "ms_last_auth_url", "ms_js_redirect_attempted"]:
         st.session_state.pop(k, None)
     if clear_url:
         try:
@@ -39,15 +43,14 @@ def _reset_login_state(clear_url=True):
         except Exception:
             pass
 
+
 def logout_button():
     if st.button("Log out"):
         _reset_login_state()
         st.rerun()
 
+
 def _ensure_flow(app, scopes):
-    """
-    Ensure we have a flow stored in session_state.
-    """
     cfg = _cfg()
     if "ms_flow" not in st.session_state:
         st.session_state["ms_flow"] = app.initiate_auth_code_flow(
@@ -56,15 +59,14 @@ def _ensure_flow(app, scopes):
         )
     return st.session_state["ms_flow"]
 
+
 def login_ui(scopes=None):
     """
-    Streamlit Cloud friendly auth flow.
-    Key behavior:
-      - Uses a SAME-TAB redirect button (no new tabs)
-      - If callback arrives but flow missing, restarts cleanly
+    Minimal UI:
+      - Shows only a Sign In button
+      - Attempts same-tab redirect via JS
+      - If JS is blocked, shows a fallback link button (no explanation text)
     """
-    import streamlit.components.v1 as components
-
     app = _msal_app()
 
     if scopes is None:
@@ -73,31 +75,24 @@ def login_ui(scopes=None):
 
     # Already logged in
     if st.session_state.get("ms_token"):
-        st.success("Logged in to Microsoft.")
+        st.success("Logged in.")
         logout_button()
         return
 
     qp = st.query_params
 
-    # --- CALLBACK ---
+    # CALLBACK
     if "code" in qp:
         flow = st.session_state.get("ms_flow")
         if not flow:
-            st.warning(
-                "Login callback received but session state was lost. "
-                "Click Sign in again (same tab)."
-            )
+            # session lost: restart silently
             _reset_login_state(clear_url=True)
-            # fall through to start login again
-
         else:
             try:
                 auth_response = {k: qp.get(k) for k in qp.keys()}
                 result = app.acquire_token_by_auth_code_flow(flow, auth_response)
-            except ValueError as e:
-                st.warning(f"Login interrupted ({str(e)}). Please sign in again.")
+            except ValueError:
                 _reset_login_state(clear_url=True)
-                # fall through to start login again
             else:
                 if "access_token" in result:
                     st.session_state["ms_token"] = result
@@ -105,32 +100,37 @@ def login_ui(scopes=None):
                         st.query_params.clear()
                     except Exception:
                         pass
-                    st.success("Login successful.")
                     st.rerun()
                 else:
-                    st.error(f"Login failed: {result.get('error')} - {result.get('error_description')}")
                     _reset_login_state(clear_url=True)
-                    # fall through to start login again
 
-    # --- START LOGIN (SAME TAB) ---
+    # START LOGIN
     flow = _ensure_flow(app, scopes)
     auth_url = flow["auth_uri"]
+    st.session_state["ms_last_auth_url"] = auth_url
 
-    st.markdown("### Microsoft Sign-in required")
-    st.caption("This button will open Microsoft sign-in in the SAME tab (prevents session loss).")
+    # We attempt JS redirect only when user clicks Sign In.
+    clicked = st.button("Sign In")
 
-    if st.button("Sign in with Microsoft (same tab)"):
-        # Force same-tab navigation (no new tab)
+    if clicked:
+        st.session_state["ms_js_redirect_attempted"] = True
+        # same-tab redirect attempt
         components.html(
             f"""
             <script>
-              window.top.location.href = "{auth_url}";
+              try {{
+                window.top.location.href = "{auth_url}";
+              }} catch (e) {{
+                // do nothing; fallback shown below
+              }}
             </script>
             """,
             height=0,
         )
 
-    st.caption("If nothing happens, your browser may block redirects. Try allowing redirects/popups for this site.")
+    # If user clicked but nothing happened (JS blocked), show fallback link button.
+    if st.session_state.get("ms_js_redirect_attempted"):
+        st.link_button("Sign In (fallback)", auth_url)
 
 
 def get_access_token():
@@ -145,7 +145,6 @@ def get_access_token():
         expires_at = token["expires_at"]
 
     if int(expires_at) - int(time.time()) < 120:
-        st.warning("Session expired. Please log in again.")
         _reset_login_state()
         st.rerun()
 
