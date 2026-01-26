@@ -105,7 +105,7 @@ def _fill_sequence_table(table, df):
     for _, r in df.iterrows():
         cells = table.add_row().cells
         cells[0].text = str(r.get("Date", ""))
-        cells[1].text = str(r.getSstr(r.get("Time", "")))
+        cells[1].text = str(r.get("Time", ""))          # ✅ FIXED HERE
         cells[2].text = str(r.get("Category", ""))
         cells[3].text = str(r.get("Message", ""))
 
@@ -395,7 +395,6 @@ st.divider()
 # MAIN FORM
 # ==============================
 loaded = st.session_state.get("loaded_update_target")
-this_year = str(datetime.now().year)
 
 if mode == "Create New":
     year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)], index=0, key="main_year")
