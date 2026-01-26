@@ -156,6 +156,90 @@ def generate_docx(data):
 
 
 # ==============================
+# PREFILL / PARSE EXISTING DOCX
+# ==============================
+def _get_2col_table_value(table, label):
+    for row in table.rows:
+        if row.cells and row.cells[0].text.strip() == label.strip():
+            return row.cells[1].text.strip()
+    return ""
+
+
+def _get_paragraph_after_heading(doc, heading_text):
+    for i, p in enumerate(doc.paragraphs):
+        if p.text.strip() == heading_text.strip():
+            if i + 1 < len(doc.paragraphs):
+                return doc.paragraphs[i + 1].text.strip()
+            return ""
+    return ""
+
+
+def _table_to_sequence_df(table):
+    rows = []
+    for r in table.rows:
+        cells = [c.text.strip() for c in r.cells]
+        # Expect 4 columns Date/Time/Category/Message
+        if len(cells) >= 4:
+            rows.append({"Date": cells[0], "Time": cells[1], "Category": cells[2], "Message": cells[3]})
+    # In your template, this table has no header row; but user may have blank first row
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame([{"Date": "", "Time": "", "Category": "", "Message": ""}])
+    return df
+
+
+def _table_to_actions_df(table):
+    rows = []
+    # This table has a header row in template; we skip if it looks like header
+    for idx, r in enumerate(table.rows):
+        cells = [c.text.strip() for c in r.cells]
+        if len(cells) >= 5:
+            # Skip header row if detected
+            if idx == 0 and ("Performed" in cells[2] or "Action" in cells[3] or "Result" in cells[4]):
+                continue
+            rows.append({"Date": cells[0], "Time": cells[1], "Performed by": cells[2], "Action": cells[3], "Result": cells[4]})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame([{"Date": "", "Time": "", "Performed by": "", "Action": "", "Result": ""}])
+    return df
+
+
+def parse_existing_ir_docx(docx_bytes: bytes) -> dict:
+    doc = Document(io.BytesIO(docx_bytes))
+    # Based on your template structure
+    t0, t1, t2, t3 = doc.tables[0], doc.tables[1], doc.tables[2], doc.tables[3]
+
+    data = {
+        "reported_by": _get_2col_table_value(t0, "Reported by"),
+        "position": _get_2col_table_value(t0, "Position"),
+        "date_of_report": _get_2col_table_value(t0, "Date of Report"),
+        "full_incident_no": _get_2col_table_value(t0, "Incident No."),
+
+        "incident_date": _get_2col_table_value(t1, "Date (YYYY-MM-DD)"),
+        "incident_time": _get_2col_table_value(t1, "Time"),
+        "location": _get_2col_table_value(t1, "Location"),
+        "current_status": _get_2col_table_value(t1, "Current Status"),
+
+        "nature": _get_paragraph_after_heading(doc, "Nature of Incident"),
+        "damages": _get_paragraph_after_heading(doc, "Damages Incurred (if any)"),
+        "investigation": _get_paragraph_after_heading(doc, "Investigation and Analysis"),
+        "conclusion": _get_paragraph_after_heading(doc, "Conclusion and Recommendations"),
+
+        "sequence_df": _table_to_sequence_df(t2),
+        "actions_df": _table_to_actions_df(t3),
+    }
+    return data
+
+
+def extract_serial_from_full_incident_no(full_no: str) -> str:
+    # expects ...-0001
+    if not full_no:
+        return ""
+    m = re.search(r"-(\d{4})\s*$", full_no.strip())
+    return m.group(1) if m else ""
+
+
+# ==============================
 # UI HELPERS
 # ==============================
 def captions_editor(files, key):
@@ -183,6 +267,30 @@ def _must_have_token():
     return token
 
 
+def _set_defaults_if_missing():
+    # Ensures session_state has defaults for widget keys (prevents KeyError)
+    defaults = {
+        "reported_by": "",
+        "position": "",
+        "date_of_report": date.today().strftime("%Y-%m-%d"),
+
+        "incident_date": date.today().strftime("%Y-%m-%d"),
+        "incident_time": datetime.now().strftime("%H:%M:%S"),
+        "location": "",
+        "current_status": "Resolved",
+
+        "nature": "",
+        "damages": "None",
+        "investigation": "",
+        "conclusion": "",
+
+        "seq_df": pd.DataFrame([{"Date": "", "Time": "", "Category": "", "Message": ""}]),
+        "actions_df": pd.DataFrame([{"Date": "", "Time": "", "Performed by": "", "Action": "", "Result": ""}]),
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
+
+
 # ==============================
 # STREAMLIT APP
 # ==============================
@@ -203,56 +311,152 @@ if "sp_site_id" not in st.session_state or "sp_drive_id" not in st.session_state
 drive_id = st.session_state["sp_drive_id"]
 
 this_year = str(datetime.now().year)
-year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)], index=0)
+_set_defaults_if_missing()
 
-city = st.selectbox("Ground Station Location", list(CITY_CODES.keys()))
+mode = st.radio("Mode", ["Create New", "Update Existing"], horizontal=True)
+
+# ==============================
+# UPDATE EXISTING (LOAD & PREFILL)
+# ==============================
+if mode == "Update Existing":
+    st.subheader("Select existing Incident Report to update")
+
+    u_year = st.selectbox("Year", [this_year, str(int(this_year) - 1)], index=0, key="u_year")
+    u_city = st.selectbox("Ground Station Location", list(CITY_CODES.keys()), key="u_city")
+
+    base_path = f"{INCIDENT_REPORTS_ROOT_PATH}/{u_year}/{u_city}"
+
+    if st.button("Refresh folders/files", key="u_refresh"):
+        for k in ["u_folders", "u_files", "u_files_folder", "u_loaded_docx_meta"]:
+            st.session_state.pop(k, None)
+
+    if "u_folders" not in st.session_state:
+        try:
+            st.session_state["u_folders"] = spg.list_incident_folders(token, drive_id, base_path)
+        except Exception as e:
+            st.error(f"Cannot list incident folders: {e}")
+            st.session_state["u_folders"] = []
+
+    folders = st.session_state.get("u_folders", [])
+    folder_names = [f["name"] for f in folders]
+
+    u_folder_name = st.selectbox("Incident Folder (Incident No.)", ["-- select --"] + folder_names, key="u_folder")
+    if u_folder_name != "-- select --":
+        folder_meta = next((x for x in folders if x["name"] == u_folder_name), None)
+        folder_id = folder_meta["id"]
+
+        if "u_files" not in st.session_state or st.session_state.get("u_files_folder") != folder_id:
+            try:
+                st.session_state["u_files"] = spg.list_files(token, drive_id, folder_id)
+                st.session_state["u_files_folder"] = folder_id
+            except Exception as e:
+                st.error(f"Cannot list files: {e}")
+                st.session_state["u_files"] = []
+
+        files = st.session_state.get("u_files", [])
+        docx_files = [f for f in files if f["name"].lower().endswith(".docx")]
+        docx_names = [f["name"] for f in docx_files]
+
+        u_docx = st.selectbox("DOCX file", ["-- select --"] + docx_names, key="u_docx")
+        if u_docx != "-- select --":
+            fmeta = next((x for x in docx_files if x["name"] == u_docx), None)
+
+            if st.button("Load into form", key="u_load"):
+                try:
+                    b = spg.download_file_bytes(token, drive_id, fmeta["id"])
+                    parsed = parse_existing_ir_docx(b)
+
+                    # Prefill app
+                    st.session_state["reported_by"] = parsed.get("reported_by", "")
+                    st.session_state["position"] = parsed.get("position", "")
+                    st.session_state["date_of_report"] = parsed.get("date_of_report", date.today().strftime("%Y-%m-%d"))
+
+                    st.session_state["incident_date"] = parsed.get("incident_date", date.today().strftime("%Y-%m-%d"))
+                    st.session_state["incident_time"] = parsed.get("incident_time", datetime.now().strftime("%H:%M:%S"))
+                    st.session_state["location"] = parsed.get("location", u_city)
+                    st.session_state["current_status"] = parsed.get("current_status", "Resolved") or "Resolved"
+
+                    st.session_state["nature"] = parsed.get("nature", "")
+                    st.session_state["damages"] = parsed.get("damages", "None") or "None"
+                    st.session_state["investigation"] = parsed.get("investigation", "")
+                    st.session_state["conclusion"] = parsed.get("conclusion", "")
+
+                    st.session_state["seq_df"] = parsed.get("sequence_df") or pd.DataFrame([{"Date": "", "Time": "", "Category": "", "Message": ""}])
+                    st.session_state["actions_df"] = parsed.get("actions_df") or pd.DataFrame([{"Date": "", "Time": "", "Performed by": "", "Action": "", "Result": ""}])
+
+                    st.session_state["loaded_update_target"] = {
+                        "year": u_year,
+                        "city": u_city,
+                        "folder_name": u_folder_name,
+                        "folder_id": folder_id,
+                        "docx_name": u_docx,
+                        "docx_id": fmeta["id"],
+                    }
+
+                    st.success("Loaded. Scroll down to edit the form, then click Generate Report.")
+                except Exception as e:
+                    st.error(f"Load failed: {e}")
+
+st.divider()
+
+# ==============================
+# CREATE / EDIT FORM (SAME UI FOR BOTH MODES)
+# ==============================
+year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)], index=0, key="main_year")
+city = st.selectbox("Ground Station Location", list(CITY_CODES.keys()), key="main_city")
 site_code = CITY_CODES[city]
 
-serial_raw = st.text_input("Incident serial (000#)", placeholder="e.g. 0001 (or 1)")
+serial_raw = st.text_input("Incident serial (000#)", value=extract_serial_from_full_incident_no(st.session_state.get("loaded_update_target", {}).get("folder_name", "")) or "", placeholder="e.g. 0001 (or 1)", key="serial_raw")
 serial = normalize_serial(serial_raw)
+
 full_incident_no = f"SMCOD-IR-GS-{site_code}-{year}-{serial}" if serial else ""
 st.text_input("Full Incident No. (auto)", value=full_incident_no, disabled=True)
 
 with st.form("ir_form"):
     c1, c2 = st.columns(2)
-    with c1:
-        reported_by = st.text_input("Reported by")
-        position = st.text_input("Position")
-        date_of_report = st.date_input("Date of Report", value=date.today()).strftime("%Y-%m-%d")
-    with c2:
-        incident_date = st.date_input("Incident Date", value=date.today()).strftime("%Y-%m-%d")
-        incident_time = st.text_input("Incident Time", value=datetime.now().strftime("%H:%M:%S"))
-        location = st.text_input("Location", value=city)
-        current_status = st.selectbox("Current Status", ["Resolved", "Ongoing", "Monitoring", "Open"])
 
-    nature = st.text_area("Nature of Incident", height=120)
+    with c1:
+        reported_by = st.text_input("Reported by", key="reported_by")
+        position = st.text_input("Position", key="position")
+        date_of_report = st.text_input("Date of Report (YYYY-MM-DD)", key="date_of_report")
+
+    with c2:
+        incident_date = st.text_input("Incident Date (YYYY-MM-DD)", key="incident_date")
+        incident_time = st.text_input("Incident Time", key="incident_time")
+        location = st.text_input("Location", key="location")
+        current_status = st.selectbox("Current Status", ["Resolved", "Ongoing", "Monitoring", "Open"], index=["Resolved","Ongoing","Monitoring","Open"].index(st.session_state.get("current_status","Resolved")), key="current_status")
+
+    nature = st.text_area("Nature of Incident", height=120, key="nature")
 
     st.subheader("Sequence of Events")
     seq_df = st.data_editor(
-        pd.DataFrame([{"Date": incident_date, "Time": "", "Category": "", "Message": ""}]),
+        st.session_state.get("seq_df", pd.DataFrame([{"Date": "", "Time": "", "Category": "", "Message": ""}])),
         num_rows="dynamic",
         use_container_width=True,
+        key="seq_editor",
     )
-    seq_imgs = st.file_uploader("Sequence Photos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+
+    seq_imgs = st.file_uploader("Sequence Photos (optional)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
     seq_caps = captions_editor(seq_imgs or [], "seq_caps")
 
-    damages = st.text_area("Damages Incurred", value="None")
-    dmg_imgs = st.file_uploader("Damage Photos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    damages = st.text_area("Damages Incurred", key="damages")
+    dmg_imgs = st.file_uploader("Damage Photos (optional)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
     dmg_caps = captions_editor(dmg_imgs or [], "dmg_caps")
 
-    investigation = st.text_area("Investigation and Analysis", height=120)
-    inv_imgs = st.file_uploader("Investigation Photos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    investigation = st.text_area("Investigation and Analysis", height=120, key="investigation")
+    inv_imgs = st.file_uploader("Investigation Photos (optional)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
     inv_caps = captions_editor(inv_imgs or [], "inv_caps")
 
-    conclusion = st.text_area("Conclusion and Recommendations", height=120)
-    con_imgs = st.file_uploader("Conclusion Photos", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+    conclusion = st.text_area("Conclusion and Recommendations", height=120, key="conclusion")
+    con_imgs = st.file_uploader("Conclusion Photos (optional)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
     con_caps = captions_editor(con_imgs or [], "con_caps")
 
     st.subheader("Response and Actions Taken")
     actions_df = st.data_editor(
-        pd.DataFrame([{"Date": incident_date, "Time": "", "Performed by": "", "Action": "", "Result": ""}]),
+        st.session_state.get("actions_df", pd.DataFrame([{"Date": "", "Time": "", "Performed by": "", "Action": "", "Result": ""}])),
         num_rows="dynamic",
         use_container_width=True,
+        key="actions_editor",
     )
 
     submit = st.form_submit_button("Generate Report")
@@ -261,14 +465,6 @@ if submit:
     if not serial:
         st.error("Enter a valid incident serial (numbers only up to 4 digits). Example: 0001 or 1.")
         st.stop()
-
-    try:
-        is_dup = spg.check_duplicate_ir(token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, full_incident_no)
-        if is_dup:
-            st.error("Duplicate found: this Incident No folder already exists. Use a new serial.")
-            st.stop()
-    except Exception as e:
-        st.warning(f"Duplicate check failed (continuing): {e}")
 
     data = {
         "reported_by": reported_by,
@@ -297,25 +493,42 @@ if submit:
 
     docx_bytes = generate_docx(data)
 
+    # Upload target:
+    # - If Update Existing was loaded: overwrite in same incident folder
+    # - Else: ensure path Year/City/IncidentNo and upload there
     try:
-        with st.spinner("Creating folder and uploading DOCX to SharePoint..."):
-            incident_folder = spg.ensure_path(
-                token,
-                drive_id,
-                INCIDENT_REPORTS_ROOT_PATH,
-                parts=[year, city, full_incident_no],
-            )
+        with st.spinner("Uploading DOCX to SharePoint..."):
+            loaded = st.session_state.get("loaded_update_target")
+
+            if loaded and loaded.get("folder_id"):
+                target_folder_id = loaded["folder_id"]
+                filename = loaded.get("docx_name") or f"{full_incident_no}.docx"
+            else:
+                # Optional duplicate check on create
+                try:
+                    is_dup = spg.check_duplicate_ir(token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, full_incident_no)
+                    if is_dup:
+                        st.error("Duplicate found: this Incident No folder already exists. Use a new serial.")
+                        st.stop()
+                except Exception:
+                    pass
+
+                incident_folder = spg.ensure_path(
+                    token, drive_id, INCIDENT_REPORTS_ROOT_PATH, parts=[year, city, full_incident_no]
+                )
+                target_folder_id = incident_folder["id"]
+                filename = f"{full_incident_no}.docx"
 
             spg.upload_file_to_folder(
                 token,
                 drive_id,
-                folder_item_id=incident_folder["id"],
-                filename=f"{full_incident_no}.docx",
+                folder_item_id=target_folder_id,
+                filename=filename,
                 content_bytes=docx_bytes,
                 content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
 
-        st.success("Report generated, folder created, and DOCX uploaded.")
+        st.success("Report generated and uploaded.")
     except Exception as e:
         st.error(f"Upload failed: {e}")
 
@@ -325,94 +538,3 @@ if submit:
         file_name=f"{full_incident_no}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
-
-
-# ==============================
-# FILE VIEWER & EDITOR (FIXED FOR YOUR STRUCTURE)
-# ==============================
-st.divider()
-st.subheader("File Viewer & Editor (SharePoint)")
-
-viewer_year = st.selectbox("Year", [this_year, str(int(this_year) - 1)], index=0, key="v_year")
-viewer_city = st.selectbox("Ground Station Location", list(CITY_CODES.keys()), key="v_city")
-
-base_path = f"{INCIDENT_REPORTS_ROOT_PATH}/{viewer_year}/{viewer_city}"
-st.caption(f"City folder: {base_path}")
-
-# Load incident folders
-if st.button("Refresh folders/files", key="v_refresh"):
-    for k in ["v_incident_folders", "v_files", "v_loaded_id", "v_loaded_text"]:
-        st.session_state.pop(k, None)
-
-if "v_incident_folders" not in st.session_state:
-    try:
-        st.session_state["v_incident_folders"] = spg.list_incident_folders(token, drive_id, base_path)
-    except Exception as e:
-        st.error(f"Cannot list incident folders: {e}")
-        st.session_state["v_incident_folders"] = []
-
-folders = st.session_state.get("v_incident_folders", [])
-folder_names = [f["name"] for f in folders]
-
-incident_folder_name = st.selectbox("Incident Folder (Incident No.)", ["-- select --"] + folder_names, key="v_folder")
-
-if incident_folder_name != "-- select --":
-    folder_meta = next((x for x in folders if x["name"] == incident_folder_name), None)
-    folder_id = folder_meta["id"]
-
-    if "v_files" not in st.session_state or st.session_state.get("v_files_folder") != folder_id:
-        try:
-            st.session_state["v_files"] = spg.list_files(token, drive_id, folder_id)
-            st.session_state["v_files_folder"] = folder_id
-        except Exception as e:
-            st.error(f"Cannot list files in incident folder: {e}")
-            st.session_state["v_files"] = []
-
-    files = st.session_state.get("v_files", [])
-    file_names = [x["name"] for x in files]
-
-    selected_file = st.selectbox("File", ["-- select --"] + file_names, key="v_file")
-
-    if selected_file != "-- select --":
-        fmeta = next((x for x in files if x["name"] == selected_file), None)
-        file_id = fmeta["id"]
-        ext = selected_file.lower().rsplit(".", 1)[-1] if "." in selected_file else ""
-
-        # DOCX / others: download
-        if st.button("Download file", key="v_download"):
-            b = spg.download_file_bytes(token, drive_id, file_id)
-            st.download_button(
-                "Click to download",
-                data=b,
-                file_name=selected_file,
-                mime="application/octet-stream",
-            )
-
-        # Text files: view + edit + save
-        if ext in ["txt", "md", "log", "csv"]:
-            if st.button("Load contents", key="v_load"):
-                try:
-                    st.session_state["v_loaded_id"] = file_id
-                    st.session_state["v_loaded_text"] = spg.download_file_text(token, drive_id, file_id)
-                except Exception as e:
-                    st.error(f"Load failed: {e}")
-
-            if st.session_state.get("v_loaded_id") == file_id:
-                new_text = st.text_area("Contents", value=st.session_state.get("v_loaded_text", ""), height=320)
-
-                c1, c2 = st.columns([1, 1])
-                with c1:
-                    if st.button("Save (overwrite)", key="v_save"):
-                        try:
-                            spg.update_file_text(token, drive_id, file_id, new_text)
-                            st.success("Saved.")
-                            st.session_state["v_loaded_text"] = new_text
-                        except Exception as e:
-                            st.error(f"Save failed: {e}")
-
-                with c2:
-                    if st.button("Unload", key="v_unload"):
-                        st.session_state.pop("v_loaded_id", None)
-                        st.session_state.pop("v_loaded_text", None)
-        else:
-            st.info("Editing is enabled only for text files (.txt, .md, .log, .csv). For DOCX/PDF, use Download.")
