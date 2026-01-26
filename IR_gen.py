@@ -32,7 +32,7 @@ INCIDENT_REPORTS_ROOT_PATH = st.secrets.get("sharepoint", {}).get(
     "Ground Station Operations/Installations, Maintenance and Repair/Incident Reports",
 )
 
-# WRITE mode always
+# Always write mode (create folders/upload)
 SCOPES = ms_graph.DEFAULT_SCOPES_WRITE
 
 
@@ -77,7 +77,7 @@ def _append_figures_after_heading(doc, heading_text, files, captions, figure_sta
             fig_no = figure_start
 
             for idx, f in enumerate(files):
-                # image
+                # image (centered, standard width)
                 img_p = _insert_paragraph_after(anchor)
                 img_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = img_p.add_run()
@@ -216,7 +216,7 @@ drive_id = st.session_state["sp_drive_id"]
 this_year = str(datetime.now().year)
 year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)], index=0)
 
-city = st.selectbox("City", list(CITY_CODES.keys()))
+city = st.selectbox("Ground Station Location", list(CITY_CODES.keys()))
 site_code = CITY_CODES[city]
 
 serial_raw = st.text_input("Incident serial (000#)", placeholder="e.g. 0001 (or 1)")
@@ -274,7 +274,6 @@ with st.form("ir_form"):
 
     submit = st.form_submit_button("Generate Report")
 
-
 # -----------------------
 # GENERATE + CREATE FOLDER + UPLOAD DOCX
 # -----------------------
@@ -319,10 +318,8 @@ if submit:
 
     docx_bytes = generate_docx(data)
 
-    # Create folder structure and upload DOCX
     try:
         with st.spinner("Creating folder and uploading DOCX to SharePoint..."):
-            # Ensure /<root>/<year>/<city>/<incident_no>/ exists
             incident_folder = spg.ensure_path(
                 token,
                 drive_id,
@@ -350,48 +347,40 @@ if submit:
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
-
 # ==============================
-# FILE VIEWER & EDITOR
+# FILE VIEWER & EDITOR (UPDATED UI)
 # ==============================
 st.divider()
 st.subheader("File Viewer & Editor (SharePoint)")
 
-scope_choice = st.radio(
-    "Where is the file?",
-    ["Root (Incident Reports)", "Year/City Folder", "This Incident Folder"],
-    horizontal=True,
-)
+viewer_year = st.selectbox("Year (for File Viewer)", [this_year, str(int(this_year) - 1)], index=0, key="viewer_year")
+viewer_city = st.selectbox("Ground Station Location (for File Viewer)", list(CITY_CODES.keys()), key="viewer_city")
 
-base_path = INCIDENT_REPORTS_ROOT_PATH
-if scope_choice == "Year/City Folder":
-    base_path = f"{INCIDENT_REPORTS_ROOT_PATH}/{year}/{city}"
-elif scope_choice == "This Incident Folder":
-    if not full_incident_no:
-        st.info("Enter a valid incident serial above to enable incident folder selection.")
-        st.stop()
-    base_path = f"{INCIDENT_REPORTS_ROOT_PATH}/{year}/{city}/{full_incident_no}"
+viewer_path = f"{INCIDENT_REPORTS_ROOT_PATH}/{viewer_year}/{viewer_city}"
 
-col1, col2 = st.columns([1, 1])
+c1, c2 = st.columns([1, 2])
+with c1:
+    refresh = st.button("Refresh file list", key="refresh_viewer")
+with c2:
+    st.caption(f"Folder: {viewer_path}")
 
-with col1:
-    if st.button("Refresh file list"):
-        st.session_state.pop("text_files", None)
+if refresh:
+    st.session_state.pop("viewer_text_files", None)
+    st.session_state.pop("viewer_loaded_file_id", None)
+    st.session_state.pop("viewer_loaded_content", None)
 
-with col2:
-    st.caption(f"Folder: {base_path}")
-
-if "text_files" not in st.session_state:
+# Load list once
+if "viewer_text_files" not in st.session_state:
     try:
-        st.session_state["text_files"] = spg.list_text_files(token, drive_id, base_path)
+        st.session_state["viewer_text_files"] = spg.list_text_files(token, drive_id, viewer_path)
     except Exception as e:
         st.error(f"Cannot list files: {e}")
-        st.session_state["text_files"] = []
+        st.session_state["viewer_text_files"] = []
 
-files = st.session_state.get("text_files", [])
+files = st.session_state.get("viewer_text_files", [])
 file_names = [f["name"] for f in files]
 
-selected_name = st.selectbox("Select a file", ["-- select --"] + file_names)
+selected_name = st.selectbox("Select a file", ["-- select --"] + file_names, key="viewer_select_file")
 
 if selected_name != "-- select --":
     file_meta = next((x for x in files if x["name"] == selected_name), None)
@@ -401,33 +390,33 @@ if selected_name != "-- select --":
 
     file_id = file_meta["id"]
 
-    if st.button("Load file contents"):
+    if st.button("Load file contents", key="viewer_load"):
         try:
             content = spg.download_file_text(token, drive_id, file_id)
-            st.session_state["loaded_file_id"] = file_id
-            st.session_state["loaded_file_name"] = selected_name
-            st.session_state["loaded_content"] = content
+            st.session_state["viewer_loaded_file_id"] = file_id
+            st.session_state["viewer_loaded_content"] = content
         except Exception as e:
             st.error(f"Failed to load: {e}")
 
-    if st.session_state.get("loaded_file_id") == file_id:
+    if st.session_state.get("viewer_loaded_file_id") == file_id:
         new_text = st.text_area(
             "Contents",
-            value=st.session_state.get("loaded_content", ""),
+            value=st.session_state.get("viewer_loaded_content", ""),
             height=320,
+            key="viewer_contents",
         )
 
-        csave, cclear = st.columns([1, 1])
-        with csave:
-            if st.button("Save (overwrite on SharePoint)"):
+        s1, s2 = st.columns([1, 1])
+        with s1:
+            if st.button("Save (overwrite on SharePoint)", key="viewer_save"):
                 try:
                     spg.update_file_text(token, drive_id, file_id, new_text)
                     st.success("Saved.")
-                    st.session_state["loaded_content"] = new_text
+                    st.session_state["viewer_loaded_content"] = new_text
                 except Exception as e:
                     st.error(f"Save failed: {e}")
 
-        with cclear:
-            if st.button("Unload"):
-                for k in ["loaded_file_id", "loaded_file_name", "loaded_content"]:
-                    st.session_state.pop(k, None)
+        with s2:
+            if st.button("Unload", key="viewer_unload"):
+                st.session_state.pop("viewer_loaded_file_id", None)
+                st.session_state.pop("viewer_loaded_content", None)
