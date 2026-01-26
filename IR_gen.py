@@ -47,7 +47,7 @@ def _clear_table_rows_except_header(table, header_rows=1):
 
 def _set_2col_table_value(table, label, value):
     for row in table.rows:
-        if row.cells[0].text.strip() == label.strip():
+        if row.cells and row.cells[0].text.strip() == label.strip():
             row.cells[1].text = "" if value is None else str(value)
             return
 
@@ -156,7 +156,7 @@ def generate_docx(data):
 
 
 # ==============================
-# PREFILL / PARSE EXISTING DOCX
+# PARSE EXISTING DOCX (PREFILL)
 # ==============================
 def _get_2col_table_value(table, label):
     for row in table.rows:
@@ -178,10 +178,8 @@ def _table_to_sequence_df(table):
     rows = []
     for r in table.rows:
         cells = [c.text.strip() for c in r.cells]
-        # Expect 4 columns Date/Time/Category/Message
         if len(cells) >= 4:
             rows.append({"Date": cells[0], "Time": cells[1], "Category": cells[2], "Message": cells[3]})
-    # In your template, this table has no header row; but user may have blank first row
     df = pd.DataFrame(rows)
     if df.empty:
         df = pd.DataFrame([{"Date": "", "Time": "", "Category": "", "Message": ""}])
@@ -190,11 +188,9 @@ def _table_to_sequence_df(table):
 
 def _table_to_actions_df(table):
     rows = []
-    # This table has a header row in template; we skip if it looks like header
     for idx, r in enumerate(table.rows):
         cells = [c.text.strip() for c in r.cells]
         if len(cells) >= 5:
-            # Skip header row if detected
             if idx == 0 and ("Performed" in cells[2] or "Action" in cells[3] or "Result" in cells[4]):
                 continue
             rows.append({"Date": cells[0], "Time": cells[1], "Performed by": cells[2], "Action": cells[3], "Result": cells[4]})
@@ -206,7 +202,6 @@ def _table_to_actions_df(table):
 
 def parse_existing_ir_docx(docx_bytes: bytes) -> dict:
     doc = Document(io.BytesIO(docx_bytes))
-    # Based on your template structure
     t0, t1, t2, t3 = doc.tables[0], doc.tables[1], doc.tables[2], doc.tables[3]
 
     data = {
@@ -229,14 +224,6 @@ def parse_existing_ir_docx(docx_bytes: bytes) -> dict:
         "actions_df": _table_to_actions_df(t3),
     }
     return data
-
-
-def extract_serial_from_full_incident_no(full_no: str) -> str:
-    # expects ...-0001
-    if not full_no:
-        return ""
-    m = re.search(r"-(\d{4})\s*$", full_no.strip())
-    return m.group(1) if m else ""
 
 
 # ==============================
@@ -267,32 +254,31 @@ def _must_have_token():
     return token
 
 
-def _set_defaults_if_missing():
-    # Ensures session_state has defaults for widget keys (prevents KeyError)
+def _ensure_defaults():
     defaults = {
         "reported_by": "",
         "position": "",
         "date_of_report": date.today().strftime("%Y-%m-%d"),
-
         "incident_date": date.today().strftime("%Y-%m-%d"),
         "incident_time": datetime.now().strftime("%H:%M:%S"),
         "location": "",
         "current_status": "Resolved",
-
         "nature": "",
         "damages": "None",
         "investigation": "",
         "conclusion": "",
-
         "seq_df": pd.DataFrame([{"Date": "", "Time": "", "Category": "", "Message": ""}]),
         "actions_df": pd.DataFrame([{"Date": "", "Time": "", "Performed by": "", "Action": "", "Result": ""}]),
+        "serial_raw": "",
+        "loaded_update_target": None,  # IMPORTANT
+        "loaded_full_incident_no": "",  # IMPORTANT
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
 
 
 # ==============================
-# STREAMLIT APP
+# APP START
 # ==============================
 st.set_page_config(page_title="Incident Report Generator", layout="wide")
 st.title("Incident Report Generator")
@@ -309,14 +295,14 @@ if "sp_site_id" not in st.session_state or "sp_drive_id" not in st.session_state
         st.session_state["sp_drive_id"] = spg.get_default_drive_id(token, st.session_state["sp_site_id"])
 
 drive_id = st.session_state["sp_drive_id"]
-
 this_year = str(datetime.now().year)
-_set_defaults_if_missing()
+
+_ensure_defaults()
 
 mode = st.radio("Mode", ["Create New", "Update Existing"], horizontal=True)
 
 # ==============================
-# UPDATE EXISTING (LOAD & PREFILL)
+# UPDATE EXISTING SELECTOR
 # ==============================
 if mode == "Update Existing":
     st.subheader("Select existing Incident Report to update")
@@ -327,7 +313,7 @@ if mode == "Update Existing":
     base_path = f"{INCIDENT_REPORTS_ROOT_PATH}/{u_year}/{u_city}"
 
     if st.button("Refresh folders/files", key="u_refresh"):
-        for k in ["u_folders", "u_files", "u_files_folder", "u_loaded_docx_meta"]:
+        for k in ["u_folders", "u_files", "u_files_folder"]:
             st.session_state.pop(k, None)
 
     if "u_folders" not in st.session_state:
@@ -341,6 +327,7 @@ if mode == "Update Existing":
     folder_names = [f["name"] for f in folders]
 
     u_folder_name = st.selectbox("Incident Folder (Incident No.)", ["-- select --"] + folder_names, key="u_folder")
+
     if u_folder_name != "-- select --":
         folder_meta = next((x for x in folders if x["name"] == u_folder_name), None)
         folder_id = folder_meta["id"]
@@ -358,6 +345,7 @@ if mode == "Update Existing":
         docx_names = [f["name"] for f in docx_files]
 
         u_docx = st.selectbox("DOCX file", ["-- select --"] + docx_names, key="u_docx")
+
         if u_docx != "-- select --":
             fmeta = next((x for x in docx_files if x["name"] == u_docx), None)
 
@@ -366,7 +354,6 @@ if mode == "Update Existing":
                     b = spg.download_file_bytes(token, drive_id, fmeta["id"])
                     parsed = parse_existing_ir_docx(b)
 
-                    # Prefill app
                     st.session_state["reported_by"] = parsed.get("reported_by", "")
                     st.session_state["position"] = parsed.get("position", "")
                     st.session_state["date_of_report"] = parsed.get("date_of_report", date.today().strftime("%Y-%m-%d"))
@@ -381,8 +368,8 @@ if mode == "Update Existing":
                     st.session_state["investigation"] = parsed.get("investigation", "")
                     st.session_state["conclusion"] = parsed.get("conclusion", "")
 
-                    st.session_state["seq_df"] = parsed.get("sequence_df") or pd.DataFrame([{"Date": "", "Time": "", "Category": "", "Message": ""}])
-                    st.session_state["actions_df"] = parsed.get("actions_df") or pd.DataFrame([{"Date": "", "Time": "", "Performed by": "", "Action": "", "Result": ""}])
+                    st.session_state["seq_df"] = parsed.get("sequence_df") or st.session_state["seq_df"]
+                    st.session_state["actions_df"] = parsed.get("actions_df") or st.session_state["actions_df"]
 
                     st.session_state["loaded_update_target"] = {
                         "year": u_year,
@@ -392,50 +379,65 @@ if mode == "Update Existing":
                         "docx_name": u_docx,
                         "docx_id": fmeta["id"],
                     }
+                    st.session_state["loaded_full_incident_no"] = parsed.get("full_incident_no", u_folder_name)
 
-                    st.success("Loaded. Scroll down to edit the form, then click Generate Report.")
+                    st.success("Loaded. Scroll down, edit details, then click Generate Report.")
                 except Exception as e:
                     st.error(f"Load failed: {e}")
 
 st.divider()
 
 # ==============================
-# CREATE / EDIT FORM (SAME UI FOR BOTH MODES)
+# MAIN FORM
 # ==============================
-year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)], index=0, key="main_year")
-city = st.selectbox("Ground Station Location", list(CITY_CODES.keys()), key="main_city")
-site_code = CITY_CODES[city]
+loaded = st.session_state.get("loaded_update_target")
 
-serial_raw = st.text_input("Incident serial (000#)", value=extract_serial_from_full_incident_no(st.session_state.get("loaded_update_target", {}).get("folder_name", "")) or "", placeholder="e.g. 0001 (or 1)", key="serial_raw")
-serial = normalize_serial(serial_raw)
+if mode == "Create New":
+    year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)], index=0, key="main_year")
+    city = st.selectbox("Ground Station Location", list(CITY_CODES.keys()), key="main_city")
+    site_code = CITY_CODES[city]
 
-full_incident_no = f"SMCOD-IR-GS-{site_code}-{year}-{serial}" if serial else ""
-st.text_input("Full Incident No. (auto)", value=full_incident_no, disabled=True)
+    serial_raw = st.text_input("Incident serial (000#)", value=st.session_state.get("serial_raw", ""), key="serial_raw")
+    serial = normalize_serial(serial_raw)
+
+    full_incident_no = f"SMCOD-IR-GS-{site_code}-{year}-{serial}" if serial else ""
+    st.text_input("Full Incident No. (auto)", value=full_incident_no, disabled=True)
+
+else:
+    # UPDATE MODE: use the incident number from loaded doc
+    if not loaded:
+        st.warning("Load an existing DOCX above first.")
+        st.stop()
+
+    full_incident_no = st.session_state.get("loaded_full_incident_no") or loaded.get("folder_name", "")
+    st.text_input("Incident No.", value=full_incident_no, disabled=True)
 
 with st.form("ir_form"):
     c1, c2 = st.columns(2)
-
     with c1:
         reported_by = st.text_input("Reported by", key="reported_by")
         position = st.text_input("Position", key="position")
         date_of_report = st.text_input("Date of Report (YYYY-MM-DD)", key="date_of_report")
-
     with c2:
         incident_date = st.text_input("Incident Date (YYYY-MM-DD)", key="incident_date")
         incident_time = st.text_input("Incident Time", key="incident_time")
         location = st.text_input("Location", key="location")
-        current_status = st.selectbox("Current Status", ["Resolved", "Ongoing", "Monitoring", "Open"], index=["Resolved","Ongoing","Monitoring","Open"].index(st.session_state.get("current_status","Resolved")), key="current_status")
+        current_status = st.selectbox(
+            "Current Status",
+            ["Resolved", "Ongoing", "Monitoring", "Open"],
+            index=["Resolved", "Ongoing", "Monitoring", "Open"].index(st.session_state.get("current_status", "Resolved")),
+            key="current_status",
+        )
 
     nature = st.text_area("Nature of Incident", height=120, key="nature")
 
     st.subheader("Sequence of Events")
     seq_df = st.data_editor(
-        st.session_state.get("seq_df", pd.DataFrame([{"Date": "", "Time": "", "Category": "", "Message": ""}])),
+        st.session_state.get("seq_df"),
         num_rows="dynamic",
         use_container_width=True,
         key="seq_editor",
     )
-
     seq_imgs = st.file_uploader("Sequence Photos (optional)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
     seq_caps = captions_editor(seq_imgs or [], "seq_caps")
 
@@ -453,7 +455,7 @@ with st.form("ir_form"):
 
     st.subheader("Response and Actions Taken")
     actions_df = st.data_editor(
-        st.session_state.get("actions_df", pd.DataFrame([{"Date": "", "Time": "", "Performed by": "", "Action": "", "Result": ""}])),
+        st.session_state.get("actions_df"),
         num_rows="dynamic",
         use_container_width=True,
         key="actions_editor",
@@ -462,9 +464,12 @@ with st.form("ir_form"):
     submit = st.form_submit_button("Generate Report")
 
 if submit:
-    if not serial:
-        st.error("Enter a valid incident serial (numbers only up to 4 digits). Example: 0001 or 1.")
-        st.stop()
+    # Create mode requires serial; update mode does not
+    if mode == "Create New":
+        serial = normalize_serial(st.session_state.get("serial_raw", ""))
+        if not serial:
+            st.error("Enter a valid incident serial (numbers only up to 4 digits). Example: 0001 or 1.")
+            st.stop()
 
     data = {
         "reported_by": reported_by,
@@ -493,28 +498,22 @@ if submit:
 
     docx_bytes = generate_docx(data)
 
-    # Upload target:
-    # - If Update Existing was loaded: overwrite in same incident folder
-    # - Else: ensure path Year/City/IncidentNo and upload there
     try:
         with st.spinner("Uploading DOCX to SharePoint..."):
-            loaded = st.session_state.get("loaded_update_target")
-
-            if loaded and loaded.get("folder_id"):
+            if mode == "Update Existing":
+                # overwrite in same folder, same filename
                 target_folder_id = loaded["folder_id"]
                 filename = loaded.get("docx_name") or f"{full_incident_no}.docx"
             else:
-                # Optional duplicate check on create
-                try:
-                    is_dup = spg.check_duplicate_ir(token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, full_incident_no)
-                    if is_dup:
-                        st.error("Duplicate found: this Incident No folder already exists. Use a new serial.")
-                        st.stop()
-                except Exception:
-                    pass
+                # Create new: check duplicates then create folder
+                is_dup = spg.check_duplicate_ir(token, drive_id, INCIDENT_REPORTS_ROOT_PATH, st.session_state["main_year"], st.session_state["main_city"], full_incident_no)
+                if is_dup:
+                    st.error("Duplicate found: this Incident No folder already exists. Use a new serial.")
+                    st.stop()
 
                 incident_folder = spg.ensure_path(
-                    token, drive_id, INCIDENT_REPORTS_ROOT_PATH, parts=[year, city, full_incident_no]
+                    token, drive_id, INCIDENT_REPORTS_ROOT_PATH,
+                    parts=[st.session_state["main_year"], st.session_state["main_city"], full_incident_no]
                 )
                 target_folder_id = incident_folder["id"]
                 filename = f"{full_incident_no}.docx"
