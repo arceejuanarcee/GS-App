@@ -105,7 +105,7 @@ def _fill_sequence_table(table, df):
     for _, r in df.iterrows():
         cells = table.add_row().cells
         cells[0].text = str(r.get("Date", ""))
-        cells[1].text = str(r.get("Time", ""))
+        cells[1].text = str(r.getSstr(r.get("Time", "")))
         cells[2].text = str(r.get("Category", ""))
         cells[3].text = str(r.get("Message", ""))
 
@@ -156,7 +156,7 @@ def generate_docx(data):
 
 
 # ==============================
-# PARSE EXISTING DOCX (PREFILL)
+# PARSE EXISTING DOCX
 # ==============================
 def _get_2col_table_value(table, label):
     for row in table.rows:
@@ -204,26 +204,22 @@ def parse_existing_ir_docx(docx_bytes: bytes) -> dict:
     doc = Document(io.BytesIO(docx_bytes))
     t0, t1, t2, t3 = doc.tables[0], doc.tables[1], doc.tables[2], doc.tables[3]
 
-    data = {
+    return {
         "reported_by": _get_2col_table_value(t0, "Reported by"),
         "position": _get_2col_table_value(t0, "Position"),
         "date_of_report": _get_2col_table_value(t0, "Date of Report"),
         "full_incident_no": _get_2col_table_value(t0, "Incident No."),
-
         "incident_date": _get_2col_table_value(t1, "Date (YYYY-MM-DD)"),
         "incident_time": _get_2col_table_value(t1, "Time"),
         "location": _get_2col_table_value(t1, "Location"),
         "current_status": _get_2col_table_value(t1, "Current Status"),
-
         "nature": _get_paragraph_after_heading(doc, "Nature of Incident"),
         "damages": _get_paragraph_after_heading(doc, "Damages Incurred (if any)"),
         "investigation": _get_paragraph_after_heading(doc, "Investigation and Analysis"),
         "conclusion": _get_paragraph_after_heading(doc, "Conclusion and Recommendations"),
-
         "sequence_df": _table_to_sequence_df(t2),
         "actions_df": _table_to_actions_df(t3),
     }
-    return data
 
 
 # ==============================
@@ -270,11 +266,15 @@ def _ensure_defaults():
         "seq_df": pd.DataFrame([{"Date": "", "Time": "", "Category": "", "Message": ""}]),
         "actions_df": pd.DataFrame([{"Date": "", "Time": "", "Performed by": "", "Action": "", "Result": ""}]),
         "serial_raw": "",
-        "loaded_update_target": None,  # IMPORTANT
-        "loaded_full_incident_no": "",  # IMPORTANT
+        "loaded_update_target": None,
+        "loaded_full_incident_no": "",
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
+
+
+def _df_valid(df: object) -> bool:
+    return isinstance(df, pd.DataFrame) and (not df.empty) and (len(df.columns) > 0)
 
 
 # ==============================
@@ -368,8 +368,12 @@ if mode == "Update Existing":
                     st.session_state["investigation"] = parsed.get("investigation", "")
                     st.session_state["conclusion"] = parsed.get("conclusion", "")
 
-                    st.session_state["seq_df"] = parsed.get("sequence_df") or st.session_state["seq_df"]
-                    st.session_state["actions_df"] = parsed.get("actions_df") or st.session_state["actions_df"]
+                    seq_df = parsed.get("sequence_df")
+                    act_df = parsed.get("actions_df")
+                    if _df_valid(seq_df):
+                        st.session_state["seq_df"] = seq_df
+                    if _df_valid(act_df):
+                        st.session_state["actions_df"] = act_df
 
                     st.session_state["loaded_update_target"] = {
                         "year": u_year,
@@ -391,6 +395,7 @@ st.divider()
 # MAIN FORM
 # ==============================
 loaded = st.session_state.get("loaded_update_target")
+this_year = str(datetime.now().year)
 
 if mode == "Create New":
     year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)], index=0, key="main_year")
@@ -404,7 +409,6 @@ if mode == "Create New":
     st.text_input("Full Incident No. (auto)", value=full_incident_no, disabled=True)
 
 else:
-    # UPDATE MODE: use the incident number from loaded doc
     if not loaded:
         st.warning("Load an existing DOCX above first.")
         st.stop()
@@ -464,7 +468,6 @@ with st.form("ir_form"):
     submit = st.form_submit_button("Generate Report")
 
 if submit:
-    # Create mode requires serial; update mode does not
     if mode == "Create New":
         serial = normalize_serial(st.session_state.get("serial_raw", ""))
         if not serial:
@@ -501,19 +504,26 @@ if submit:
     try:
         with st.spinner("Uploading DOCX to SharePoint..."):
             if mode == "Update Existing":
-                # overwrite in same folder, same filename
                 target_folder_id = loaded["folder_id"]
                 filename = loaded.get("docx_name") or f"{full_incident_no}.docx"
             else:
-                # Create new: check duplicates then create folder
-                is_dup = spg.check_duplicate_ir(token, drive_id, INCIDENT_REPORTS_ROOT_PATH, st.session_state["main_year"], st.session_state["main_city"], full_incident_no)
+                is_dup = spg.check_duplicate_ir(
+                    token,
+                    drive_id,
+                    INCIDENT_REPORTS_ROOT_PATH,
+                    st.session_state["main_year"],
+                    st.session_state["main_city"],
+                    full_incident_no,
+                )
                 if is_dup:
                     st.error("Duplicate found: this Incident No folder already exists. Use a new serial.")
                     st.stop()
 
                 incident_folder = spg.ensure_path(
-                    token, drive_id, INCIDENT_REPORTS_ROOT_PATH,
-                    parts=[st.session_state["main_year"], st.session_state["main_city"], full_incident_no]
+                    token,
+                    drive_id,
+                    INCIDENT_REPORTS_ROOT_PATH,
+                    parts=[st.session_state["main_year"], st.session_state["main_city"], full_incident_no],
                 )
                 target_folder_id = incident_folder["id"]
                 filename = f"{full_incident_no}.docx"
