@@ -32,7 +32,6 @@ INCIDENT_REPORTS_ROOT_PATH = st.secrets.get("sharepoint", {}).get(
     "Ground Station Operations/Installations, Maintenance and Repair/Incident Reports",
 )
 
-# Always write mode (create folders/upload)
 SCOPES = ms_graph.DEFAULT_SCOPES_WRITE
 
 
@@ -77,13 +76,11 @@ def _append_figures_after_heading(doc, heading_text, files, captions, figure_sta
             fig_no = figure_start
 
             for idx, f in enumerate(files):
-                # image (centered, standard width)
                 img_p = _insert_paragraph_after(anchor)
                 img_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = img_p.add_run()
                 run.add_picture(io.BytesIO(f.getvalue()), width=Inches(STANDARD_IMAGE_WIDTH_IN))
 
-                # caption
                 caption_text = ""
                 if captions and idx < len(captions):
                     caption_text = (captions[idx] or "").strip()
@@ -128,7 +125,6 @@ def generate_docx(data):
     doc = Document(TEMPLATE_PATH)
     t0, t1, t2, t3 = doc.tables[0], doc.tables[1], doc.tables[2], doc.tables[3]
 
-    # Header tables
     _set_2col_table_value(t0, "Reported by", data["reported_by"])
     _set_2col_table_value(t0, "Position", data["position"])
     _set_2col_table_value(t0, "Date of Report", data["date_of_report"])
@@ -139,17 +135,14 @@ def generate_docx(data):
     _set_2col_table_value(t1, "Location", data["location"])
     _set_2col_table_value(t1, "Current Status", data["current_status"])
 
-    # Text sections
     _set_paragraph_after_heading(doc, "Nature of Incident", data["nature"])
     _set_paragraph_after_heading(doc, "Damages Incurred (if any)", data["damages"])
     _set_paragraph_after_heading(doc, "Investigation and Analysis", data["investigation"])
     _set_paragraph_after_heading(doc, "Conclusion and Recommendations", data["conclusion"])
 
-    # Tables
     _fill_sequence_table(t2, data["sequence_df"])
     _fill_actions_table(t3, data["actions_df"])
 
-    # Images with captions
     fig = 1
     fig = _append_figures_after_heading(doc, "Sequence of Events", data["sequence_images"], data["sequence_captions"], fig, "Sequence of Events")
     fig = _append_figures_after_heading(doc, "Damages Incurred (if any)", data["damages_images"], data["damages_captions"], fig, "Damages Incurred")
@@ -202,7 +195,6 @@ if not SHAREPOINT_SITE_URL:
     st.error("Missing sharepoint.site_url in Streamlit secrets.")
     st.stop()
 
-# Resolve site/drive once
 if "sp_site_id" not in st.session_state or "sp_drive_id" not in st.session_state:
     with st.spinner("Resolving SharePoint site/drive..."):
         st.session_state["sp_site_id"] = spg.resolve_site_id(token, SHAREPOINT_SITE_URL)
@@ -210,9 +202,6 @@ if "sp_site_id" not in st.session_state or "sp_drive_id" not in st.session_state
 
 drive_id = st.session_state["sp_drive_id"]
 
-# -----------------------
-# INCIDENT NUMBER
-# -----------------------
 this_year = str(datetime.now().year)
 year = st.selectbox("Year folder", [this_year, str(int(this_year) - 1)], index=0)
 
@@ -222,20 +211,14 @@ site_code = CITY_CODES[city]
 serial_raw = st.text_input("Incident serial (000#)", placeholder="e.g. 0001 (or 1)")
 serial = normalize_serial(serial_raw)
 full_incident_no = f"SMCOD-IR-GS-{site_code}-{year}-{serial}" if serial else ""
-
 st.text_input("Full Incident No. (auto)", value=full_incident_no, disabled=True)
 
-# -----------------------
-# MAIN FORM
-# -----------------------
 with st.form("ir_form"):
     c1, c2 = st.columns(2)
-
     with c1:
         reported_by = st.text_input("Reported by")
         position = st.text_input("Position")
         date_of_report = st.date_input("Date of Report", value=date.today()).strftime("%Y-%m-%d")
-
     with c2:
         incident_date = st.date_input("Incident Date", value=date.today()).strftime("%Y-%m-%d")
         incident_time = st.text_input("Incident Time", value=datetime.now().strftime("%H:%M:%S"))
@@ -274,15 +257,11 @@ with st.form("ir_form"):
 
     submit = st.form_submit_button("Generate Report")
 
-# -----------------------
-# GENERATE + CREATE FOLDER + UPLOAD DOCX
-# -----------------------
 if submit:
     if not serial:
         st.error("Enter a valid incident serial (numbers only up to 4 digits). Example: 0001 or 1.")
         st.stop()
 
-    # Optional duplicate check
     try:
         is_dup = spg.check_duplicate_ir(token, drive_id, INCIDENT_REPORTS_ROOT_PATH, year, city, full_incident_no)
         if is_dup:
@@ -347,76 +326,93 @@ if submit:
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
+
 # ==============================
-# FILE VIEWER & EDITOR (UPDATED UI)
+# FILE VIEWER & EDITOR (FIXED FOR YOUR STRUCTURE)
 # ==============================
 st.divider()
 st.subheader("File Viewer & Editor (SharePoint)")
 
-viewer_year = st.selectbox("Year (for File Viewer)", [this_year, str(int(this_year) - 1)], index=0, key="viewer_year")
-viewer_city = st.selectbox("Ground Station Location (for File Viewer)", list(CITY_CODES.keys()), key="viewer_city")
+viewer_year = st.selectbox("Year", [this_year, str(int(this_year) - 1)], index=0, key="v_year")
+viewer_city = st.selectbox("Ground Station Location", list(CITY_CODES.keys()), key="v_city")
 
-viewer_path = f"{INCIDENT_REPORTS_ROOT_PATH}/{viewer_year}/{viewer_city}"
+base_path = f"{INCIDENT_REPORTS_ROOT_PATH}/{viewer_year}/{viewer_city}"
+st.caption(f"City folder: {base_path}")
 
-c1, c2 = st.columns([1, 2])
-with c1:
-    refresh = st.button("Refresh file list", key="refresh_viewer")
-with c2:
-    st.caption(f"Folder: {viewer_path}")
+# Load incident folders
+if st.button("Refresh folders/files", key="v_refresh"):
+    for k in ["v_incident_folders", "v_files", "v_loaded_id", "v_loaded_text"]:
+        st.session_state.pop(k, None)
 
-if refresh:
-    st.session_state.pop("viewer_text_files", None)
-    st.session_state.pop("viewer_loaded_file_id", None)
-    st.session_state.pop("viewer_loaded_content", None)
-
-# Load list once
-if "viewer_text_files" not in st.session_state:
+if "v_incident_folders" not in st.session_state:
     try:
-        st.session_state["viewer_text_files"] = spg.list_text_files(token, drive_id, viewer_path)
+        st.session_state["v_incident_folders"] = spg.list_incident_folders(token, drive_id, base_path)
     except Exception as e:
-        st.error(f"Cannot list files: {e}")
-        st.session_state["viewer_text_files"] = []
+        st.error(f"Cannot list incident folders: {e}")
+        st.session_state["v_incident_folders"] = []
 
-files = st.session_state.get("viewer_text_files", [])
-file_names = [f["name"] for f in files]
+folders = st.session_state.get("v_incident_folders", [])
+folder_names = [f["name"] for f in folders]
 
-selected_name = st.selectbox("Select a file", ["-- select --"] + file_names, key="viewer_select_file")
+incident_folder_name = st.selectbox("Incident Folder (Incident No.)", ["-- select --"] + folder_names, key="v_folder")
 
-if selected_name != "-- select --":
-    file_meta = next((x for x in files if x["name"] == selected_name), None)
-    if not file_meta:
-        st.error("Selected file metadata not found. Click Refresh file list.")
-        st.stop()
+if incident_folder_name != "-- select --":
+    folder_meta = next((x for x in folders if x["name"] == incident_folder_name), None)
+    folder_id = folder_meta["id"]
 
-    file_id = file_meta["id"]
-
-    if st.button("Load file contents", key="viewer_load"):
+    if "v_files" not in st.session_state or st.session_state.get("v_files_folder") != folder_id:
         try:
-            content = spg.download_file_text(token, drive_id, file_id)
-            st.session_state["viewer_loaded_file_id"] = file_id
-            st.session_state["viewer_loaded_content"] = content
+            st.session_state["v_files"] = spg.list_files(token, drive_id, folder_id)
+            st.session_state["v_files_folder"] = folder_id
         except Exception as e:
-            st.error(f"Failed to load: {e}")
+            st.error(f"Cannot list files in incident folder: {e}")
+            st.session_state["v_files"] = []
 
-    if st.session_state.get("viewer_loaded_file_id") == file_id:
-        new_text = st.text_area(
-            "Contents",
-            value=st.session_state.get("viewer_loaded_content", ""),
-            height=320,
-            key="viewer_contents",
-        )
+    files = st.session_state.get("v_files", [])
+    file_names = [x["name"] for x in files]
 
-        s1, s2 = st.columns([1, 1])
-        with s1:
-            if st.button("Save (overwrite on SharePoint)", key="viewer_save"):
+    selected_file = st.selectbox("File", ["-- select --"] + file_names, key="v_file")
+
+    if selected_file != "-- select --":
+        fmeta = next((x for x in files if x["name"] == selected_file), None)
+        file_id = fmeta["id"]
+        ext = selected_file.lower().rsplit(".", 1)[-1] if "." in selected_file else ""
+
+        # DOCX / others: download
+        if st.button("Download file", key="v_download"):
+            b = spg.download_file_bytes(token, drive_id, file_id)
+            st.download_button(
+                "Click to download",
+                data=b,
+                file_name=selected_file,
+                mime="application/octet-stream",
+            )
+
+        # Text files: view + edit + save
+        if ext in ["txt", "md", "log", "csv"]:
+            if st.button("Load contents", key="v_load"):
                 try:
-                    spg.update_file_text(token, drive_id, file_id, new_text)
-                    st.success("Saved.")
-                    st.session_state["viewer_loaded_content"] = new_text
+                    st.session_state["v_loaded_id"] = file_id
+                    st.session_state["v_loaded_text"] = spg.download_file_text(token, drive_id, file_id)
                 except Exception as e:
-                    st.error(f"Save failed: {e}")
+                    st.error(f"Load failed: {e}")
 
-        with s2:
-            if st.button("Unload", key="viewer_unload"):
-                st.session_state.pop("viewer_loaded_file_id", None)
-                st.session_state.pop("viewer_loaded_content", None)
+            if st.session_state.get("v_loaded_id") == file_id:
+                new_text = st.text_area("Contents", value=st.session_state.get("v_loaded_text", ""), height=320)
+
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    if st.button("Save (overwrite)", key="v_save"):
+                        try:
+                            spg.update_file_text(token, drive_id, file_id, new_text)
+                            st.success("Saved.")
+                            st.session_state["v_loaded_text"] = new_text
+                        except Exception as e:
+                            st.error(f"Save failed: {e}")
+
+                with c2:
+                    if st.button("Unload", key="v_unload"):
+                        st.session_state.pop("v_loaded_id", None)
+                        st.session_state.pop("v_loaded_text", None)
+        else:
+            st.info("Editing is enabled only for text files (.txt, .md, .log, .csv). For DOCX/PDF, use Download.")
