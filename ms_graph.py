@@ -1,7 +1,5 @@
-# ms_graph.py
 import os
 import time
-import secrets
 import streamlit as st
 import msal
 
@@ -71,88 +69,69 @@ def logout() -> None:
     st.rerun()
 
 
-def _start_flow(app: msal.ConfidentialClientApplication, scopes: list[str]) -> str:
+def _start_flow(app: msal.ConfidentialClientApplication, scopes: list[str]) -> tuple[str, str]:
     """
-    Start login and return auth URL.
+    Create a new auth code flow, store it in cache by state,
+    and return (auth_url, state).
     """
     cfg = _require_cfg()
+    flow = app.initiate_auth_code_flow(scopes=scopes, redirect_uri=cfg["redirect_uri"])
+    state = flow.get("state")
+    if not state:
+        raise RuntimeError("MSAL did not return a state value.")
 
-    # keep a state in URL so callback can be correlated (optional but good)
-    state = secrets.token_urlsafe(16)
+    store = _flow_store()
+    store[state] = flow
 
-    flow = app.initiate_auth_code_flow(
-        scopes=scopes,
-        redirect_uri=cfg["redirect_uri"],
-        state=state,
-    )
-
-    # store flow if available (nice-to-have); but we will NOT rely on it
-    _flow_store()[state] = flow
-
+    # Put only the state in the URL (small, safe)
     try:
         st.query_params[_STATE_QP_KEY] = state
     except Exception:
         pass
 
-    return flow["auth_uri"]
+    return flow["auth_uri"], state
 
 
 def login_ui(scopes: list[str] | None = None) -> None:
     """
-    Renders Sign In, and redeems callback.
-
-    IMPORTANT FIX:
-    - If cached flow is missing, we still redeem using
-      acquire_token_by_authorization_code(code, scopes, redirect_uri)
-      so no more "session expired".
+    ONE button UI:
+      - If callback has ?code=, redeem using cached flow by state
+      - Otherwise show single Sign In link_button
     """
     app = _msal_app()
-    cfg = _require_cfg()
 
     if scopes is None:
         scopes = DEFAULT_SCOPES_READONLY
     st.session_state["ms_scopes"] = scopes
 
-    # already logged in
     if st.session_state.get("ms_token"):
         return
 
     qp = st.query_params
 
-    # ---- CALLBACK (Microsoft redirected back) ----
+    # Callback handling
     if qp.get("code"):
-        code = qp.get("code")
         state = qp.get("state") or qp.get(_STATE_QP_KEY)
-        scopes_to_use = st.session_state.get("ms_scopes") or scopes
+        if not state:
+            st.error("Login failed: missing state in callback.")
+            return
 
-        # Try normal MSAL flow redemption first (if we have the stored flow)
-        flow = None
-        if state:
-            flow = _flow_store().get(state)
+        store = _flow_store()
+        flow = store.get(state)
+        if not flow:
+            # flow not found (expired cache / new server instance)
+            st.error("Login failed: session expired. Click Sign In again.")
+            return
 
-        result = None
+        auth_response = {k: qp.get(k) for k in qp.keys()}
 
-        if flow:
-            # Standard path
-            auth_response = {k: qp.get(k) for k in qp.keys()}
-            try:
-                result = app.acquire_token_by_auth_code_flow(flow, auth_response)
-            except ValueError:
-                result = None  # fall back below
+        try:
+            result = app.acquire_token_by_auth_code_flow(flow, auth_response)
+        except ValueError as e:
+            st.error(f"Login failed: {e}")
+            return
 
-        # FALLBACK: redeem the code directly (this avoids "session expired")
-        if not result:
-            try:
-                result = app.acquire_token_by_authorization_code(
-                    code=code,
-                    scopes=scopes_to_use,
-                    redirect_uri=cfg["redirect_uri"],
-                )
-            except Exception as e:
-                st.error(f"Login failed while redeeming code: {e}")
-                return
-
-        if result and "access_token" in result:
+        if "access_token" in result:
             st.session_state["ms_token"] = result
             try:
                 st.query_params.clear()
@@ -160,13 +139,13 @@ def login_ui(scopes: list[str] | None = None) -> None:
                 pass
             st.rerun()
         else:
-            err = (result or {}).get("error") if isinstance(result, dict) else "unknown_error"
-            desc = (result or {}).get("error_description") if isinstance(result, dict) else ""
+            err = result.get("error")
+            desc = result.get("error_description")
             st.error(f"Login failed: {err} - {desc}")
             return
 
-    # ---- NOT CALLBACK: show Sign In ----
-    auth_url = _start_flow(app, scopes)
+    # Start flow / show sign in
+    auth_url, _ = _start_flow(app, scopes)
     st.link_button("Sign In", auth_url)
 
 
@@ -181,7 +160,6 @@ def get_access_token() -> str | None:
         token["expires_at"] = int(time.time()) + int(expires_in)
         expires_at = token["expires_at"]
 
-    # if expiring soon, force relogin
     if int(expires_at) - int(time.time()) < 120:
         _reset_login_state(clear_url=True)
         st.rerun()
