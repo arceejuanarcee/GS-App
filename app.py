@@ -7,7 +7,7 @@ import ms_graph
 # Config
 # -----------------------------
 st.set_page_config(
-    page_title="PhilSA Tools Portal",
+    page_title="SMCOD Tools Portal",
     layout="wide",
 )
 
