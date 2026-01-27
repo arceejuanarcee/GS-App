@@ -1,3 +1,4 @@
+# ms_graph.py
 import os
 import time
 import streamlit as st
@@ -7,6 +8,7 @@ DEFAULT_SCOPES_READONLY = ["User.Read", "Sites.Read.All"]
 DEFAULT_SCOPES_WRITE = ["User.Read", "Sites.ReadWrite.All"]
 
 _STATE_QP_KEY = "ms_state"
+_FLOW_STORE_KEY = "ms_flow_store"
 
 
 def _cfg() -> dict:
@@ -47,15 +49,19 @@ def _msal_app() -> msal.ConfidentialClientApplication:
     )
 
 
-@st.cache_resource
-def _flow_store():
-    # dict[state] = flow
-    return {}
+def _flow_store() -> dict:
+    """Per-session flow store (fixes 'session expired' across reruns/pages)."""
+    if _FLOW_STORE_KEY not in st.session_state:
+        st.session_state[_FLOW_STORE_KEY] = {}
+    return st.session_state[_FLOW_STORE_KEY]
 
 
 def _reset_login_state(clear_url: bool = True) -> None:
     for k in ["ms_token", "ms_scopes"]:
         st.session_state.pop(k, None)
+
+    # also clear flow store
+    st.session_state.pop(_FLOW_STORE_KEY, None)
 
     if clear_url:
         try:
@@ -71,7 +77,7 @@ def logout() -> None:
 
 def _start_flow(app: msal.ConfidentialClientApplication, scopes: list[str]) -> tuple[str, str]:
     """
-    Create a new auth code flow, store it in cache by state,
+    Create a new auth code flow, store it in session by state,
     and return (auth_url, state).
     """
     cfg = _require_cfg()
@@ -83,7 +89,7 @@ def _start_flow(app: msal.ConfidentialClientApplication, scopes: list[str]) -> t
     store = _flow_store()
     store[state] = flow
 
-    # Put only the state in the URL (small, safe)
+    # Put only the state in URL (small, safe)
     try:
         st.query_params[_STATE_QP_KEY] = state
     except Exception:
@@ -95,8 +101,8 @@ def _start_flow(app: msal.ConfidentialClientApplication, scopes: list[str]) -> t
 def login_ui(scopes: list[str] | None = None) -> None:
     """
     ONE button UI:
-      - If callback has ?code=, redeem using cached flow by state
-      - Otherwise show single Sign In link_button
+      - If callback has ?code=, redeem using stored flow by state
+      - Otherwise show a single Sign In link_button
     """
     app = _msal_app()
 
@@ -104,6 +110,7 @@ def login_ui(scopes: list[str] | None = None) -> None:
         scopes = DEFAULT_SCOPES_READONLY
     st.session_state["ms_scopes"] = scopes
 
+    # Already logged in
     if st.session_state.get("ms_token"):
         return
 
@@ -119,7 +126,6 @@ def login_ui(scopes: list[str] | None = None) -> None:
         store = _flow_store()
         flow = store.get(state)
         if not flow:
-            # flow not found (expired cache / new server instance)
             st.error("Login failed: session expired. Click Sign In again.")
             return
 
@@ -160,6 +166,7 @@ def get_access_token() -> str | None:
         token["expires_at"] = int(time.time()) + int(expires_in)
         expires_at = token["expires_at"]
 
+    # If expiring soon, force relogin
     if int(expires_at) - int(time.time()) < 120:
         _reset_login_state(clear_url=True)
         st.rerun()
